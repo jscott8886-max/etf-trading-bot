@@ -17,7 +17,7 @@ API_KEY    = os.environ.get("ALPACA_API_KEY", "")
 API_SECRET = os.environ.get("ALPACA_API_SECRET", "")
 PAPER_MODE = os.environ.get("PAPER_MODE", "true").lower() == "true"
  
-SYMBOLS = ["SPY", "QQQ"]
+SYMBOLS = ["SPY", "QQQ", "GLD", "SQQQ"]
  
 STRATEGY = {
     # Risk
@@ -25,23 +25,25 @@ STRATEGY = {
     "stop_loss_pct": 0.75,
     "position_size_with_trend": 0.25,    # 25% when trading with regime
     "position_size_against_trend": 0.125, # 12.5% when trading against regime
-    "max_long_positions": 2,              # Can hold SPY and QQQ long simultaneously
-    "max_short_positions": 1,             # Only 1 short at a time
-    # Short rules
-    "short_lockout_hours": 24,            # 24hr lockout after closing a short
+    "max_long_positions": 4,              # SPY, QQQ, GLD, SQQQ simultaneously
+    "max_short_positions": 2,             # Up to 2 shorts (SPY + QQQ)
+    # Short rules — 1 hour candle lockout (no 24hr, no PDT)
+    "short_lockout_minutes": 60,          # Wait for next full 1H candle after closing short
     "last_short_entry_hour_et": 14,       # No new shorts after 2PM ET
     "force_close_hour_et": 15,            # Force close all same-day positions at 3:55PM ET
     "force_close_minute_et": 55,
-    # PDT protection
-    "max_day_trades_per_week": 3,
     # VIX filter
     "vix_max": 30,                        # No trades if VIX above 30
     "vix_reduce_threshold": 20,           # Reduce size if VIX above 20
     # Signal thresholds
     "min_score_long": 4,
-    "min_score_short": 4,
+    "min_score_short_bull": 4,            # Score needed to short in BULL regime
+    "min_score_short_bear": 3,            # Lower threshold in BEAR regime
     # Cooldown
     "cooldown_minutes": 30,
+    # Symbol rules
+    "long_only": ["GLD", "SQQQ"],        # GLD and SQQQ are long only
+    "short_eligible": ["SPY", "QQQ"],     # Only SPY and QQQ can be shorted
 }
  
 bot_state = {
@@ -54,20 +56,17 @@ bot_state = {
     "total_trades": 0, "win_count": 0,
     "long_stats": {"trades": 0, "wins": 0, "pnl": 0.0},
     "short_stats": {"trades": 0, "wins": 0, "pnl": 0.0},
-    "signals": {s: {} for s in SYMBOLS},
+    "signals": {s: {} for s in ["SPY", "QQQ", "GLD", "SQQQ"]},
     "account_cash": 0.0, "account_equity": 0.0, "account_buying_power": 0.0,
     "market_regime": "UNKNOWN",           # Based on SPY 200 EMA
     "vix": 0.0,
     "vix_status": "UNKNOWN",
-    "day_trades_used": 0,                 # Rolling count this week
-    "day_trades_reset_date": None,
-    "short_lockouts": {},                 # symbol -> datetime of last short close
-    "same_day_shorts": {},                # symbol -> open date (to track PDT)
+    "short_lockouts": {},                 # symbol -> datetime of last short close (1H candle lockout)
     "active_cooldowns": {},
     "market_open": False,
     "in_trading_window": False,
     "daily_paused": False,
-    "version": "ETF-1.1"
+    "version": "ETF-1.2"
 }
  
 # ── Alpaca helpers ─────────────────────────────────────────────────────────────
@@ -298,24 +297,27 @@ def get_week_start():
     return monday.date()
  
 def check_and_reset_day_trades():
-    """Reset PDT counter on Monday"""
-    week_start = get_week_start()
-    if bot_state["day_trades_reset_date"] != str(week_start):
-        bot_state["day_trades_used"] = 0
-        bot_state["day_trades_reset_date"] = str(week_start)
-        log.info(f"PDT counter reset — week of {week_start}")
+    """PDT rules removed as of June 4 2026 — no-op"""
+    pass
  
 def is_short_locked_out(symbol):
-    """Check 24hr lockout for a symbol"""
+    """Check 1H candle lockout — wait for next full hour candle after closing short"""
     lockout_time = bot_state["short_lockouts"].get(symbol)
     if not lockout_time:
         return False
-    hours_elapsed = (datetime.now(timezone.utc) -
-                    datetime.fromisoformat(lockout_time)).total_seconds() / 3600
-    return hours_elapsed < STRATEGY["short_lockout_hours"]
+    minutes_elapsed = (datetime.now(timezone.utc) -
+                      datetime.fromisoformat(lockout_time)).total_seconds() / 60
+    # Wait until the next full hour candle has started
+    # i.e. at least 60 minutes AND we are in a new hour
+    if minutes_elapsed < STRATEGY["short_lockout_minutes"]:
+        return True
+    # Also check we are past the next hour boundary
+    lockout_dt = datetime.fromisoformat(lockout_time)
+    next_hour = (lockout_dt + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    return datetime.now(timezone.utc) < next_hour
  
 def is_same_day_short(symbol):
-    """Check if current short was opened today"""
+    """Check if current short was opened today (kept for force-close logic)"""
     pos = bot_state["positions"].get(symbol, {})
     if pos.get("side") != "short":
         return False
@@ -479,7 +481,7 @@ def check_exits(symbol, price, now, et_now, force_close=False):
             if side == "short" and is_same_day_short(symbol):
                 bot_state["day_trades_used"] += 1
                 bot_state["short_lockouts"][symbol] = now.isoformat()
-                log.info(f"Day trade used — {bot_state['day_trades_used']}/3 this week")
+                log.info(f"Short lockout set for {symbol} — next full 1H candle required")
  
             bot_state["day_pnl"] += pnl
             bot_state["total_trades"] += 1
@@ -511,7 +513,15 @@ def check_exits(symbol, price, now, et_now, force_close=False):
 # ── Entry handler ──────────────────────────────────────────────────────────────
 def try_long(symbol, sig, regime, now):
     """Try to open a long position"""
-    if not sig or sig.get("long_score", 0) < STRATEGY["min_score_long"]:
+    # SQQQ: only buy in BEAR regime (it profits when QQQ falls)
+    if symbol == "SQQQ" and regime != "BEAR":
+        return
+    # GLD: always allowed long (safe haven)
+    # SPY/QQQ: standard long rules apply
+    min_score = STRATEGY["min_score_long"]
+    # For SQQQ use short score as proxy (SQQQ goes up when market goes down)
+    score = sig.get("short_score", 0) if symbol == "SQQQ" else sig.get("long_score", 0)
+    if not sig or score < min_score:
         return
     if not sig.get("atr_ok", True):
         return
@@ -622,11 +632,11 @@ def trading_loop():
         return
  
     add_diary("SYSTEM",
-        "ETF Bot v1.0 started | SPY + QQQ | Long + Short | "
-        "TP=1.5% SL=0.75% | 1 short/day | 24hr lockout | "
-        "PDT protection 3/week | Force close 3:55PM ET",
+        "ETF Bot v1.2 started | SPY + QQQ + GLD + SQQQ | Long + Short | "
+        "TP=1.5% SL=0.75% | 1H candle lockout | No PDT limit | "
+        "Bear threshold=3 | Force close 3:55PM ET",
         "system")
-    log.info("ETF Bot v1.0 started")
+    log.info("ETF Bot v1.2 started")
  
     regime_check_time = None
     vix_check_time    = None
@@ -766,7 +776,7 @@ def health():
         "vix": bot_state["vix"],
         "vix_status": bot_state["vix_status"],
         "regime": bot_state["market_regime"],
-        "day_trades_used": bot_state["day_trades_used"]
+        "short_lockouts": {k: v for k,v in bot_state["short_lockouts"].items()}
     })
  
 @app.route("/status")
@@ -798,7 +808,6 @@ def status():
         "market_regime": bot_state["market_regime"],
         "vix": bot_state["vix"],
         "vix_status": bot_state["vix_status"],
-        "day_trades_used": bot_state["day_trades_used"],
         "short_lockouts": bot_state["short_lockouts"],
         "version": bot_state["version"]
     }))
