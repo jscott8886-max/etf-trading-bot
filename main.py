@@ -67,7 +67,7 @@ bot_state = {
     "market_open": False,
     "in_trading_window": False,
     "daily_paused": False,
-    "version": "ETF-1.0"
+    "version": "ETF-1.1"
 }
  
 # ── Alpaca helpers ─────────────────────────────────────────────────────────────
@@ -254,11 +254,14 @@ def is_market_open():
     et = get_et_time()
     wd = et.weekday()  # 0=Mon, 4=Fri, 5=Sat, 6=Sun
     if wd >= 5:
+        log.info(f"Market closed — weekend (weekday={wd})")
         return False
     market_open_mins  = 9 * 60 + 30   # 9:30AM
     market_close_mins = 16 * 60        # 4:00PM
     current_mins = et.hour * 60 + et.minute
-    return market_open_mins <= current_mins < market_close_mins
+    is_open = market_open_mins <= current_mins < market_close_mins
+    log.info(f"Market check | ET={et.strftime('%H:%M')} | mins={current_mins} | open={is_open} | wd={wd}")
+    return is_open
  
 def is_trading_window():
     """Can open new positions: 9:30AM - 3:30PM ET"""
