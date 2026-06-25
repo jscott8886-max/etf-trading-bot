@@ -1,111 +1,160 @@
-# ETF Trading Bot - v1.0
-# Long + Short on SPY and QQQ
-# PDT protection, 1 short/day, 24hr lockout, auto-close by 3:55PM ET
-import os, time, logging, math, json
+# ETF Trading Bot - v2.0
+# 5 Strategies: EMA + MSS + VPA + Breakout + Gap Detector
+# SPY + QQQ + GLD + SQQQ | Long + Short
+# No PDT limit | 1H candle lockout | Force close 3:55PM ET
+import os, time, logging, math
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import threading
- 
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
- 
+
 app = Flask(__name__)
 CORS(app)
- 
+
 API_KEY    = os.environ.get("ALPACA_API_KEY", "")
 API_SECRET = os.environ.get("ALPACA_API_SECRET", "")
 PAPER_MODE = os.environ.get("PAPER_MODE", "true").lower() == "true"
- 
-SYMBOLS = ["SPY", "QQQ", "GLD", "SQQQ"]
- 
-STRATEGY = {
-    # Risk
+
+SYMBOLS    = ["SPY", "QQQ", "GLD", "SQQQ"]
+LONG_ONLY  = ["GLD", "SQQQ"]
+SHORT_ELIG = ["SPY", "QQQ"]
+STRATEGIES = ["EMA", "MSS", "VPA", "Breakout", "Gap"]
+
+# ── Strategy configs ───────────────────────────────────────────────────────────
+EMA_CONFIG = {
+    "name": "EMA",
+    "rsi_hard_gate": 55,
+    "rsi_entry_max": 40,
+    "bb_min_bw": 0.3,
+    "min_score": 4,
+    "atr_min_mult": 0.7,
+    "volume_bonus_mult": 1.5,
+    "time_filter": True,
+}
+
+MSS_CONFIG = {
+    "name": "MSS",
+    "swing_lookback": 10,
+    "swing_fallback": 7,
+    "fallback_hours": 2,
+    "rsi_soft_threshold": 50,
+    "atr_min_mult": 0.7,
+    "volume_bonus_mult": 1.5,
+    "time_filter": True,
+}
+
+VPA_CONFIG = {
+    "name": "VPA",
+    "volume_spike_mult": 2.5,
+    "volume_avg_period": 20,
+    "min_close_ratio": 0.6,
+    "effort_result_ratio": 0.015,
+    "min_score": 3,
+    "time_filter": False,
+}
+
+BREAKOUT_CONFIG = {
+    "name": "Breakout",
+    "consolidation_candles": 8,
+    "consolidation_threshold": 0.5,
+    "breakout_volume_mult": 1.8,
+    "breakout_candle_close_ratio": 0.6,
+    "min_breakout_pct": 0.3,
+    "time_filter": False,
+}
+
+GAP_CONFIG = {
+    "name": "Gap",
+    "min_gap_pct": 0.5,        # Min 0.5% gap to qualify
+    "max_gap_pct": 3.0,         # Ignore extreme gaps > 3% (too risky)
+    "volume_confirm_mult": 1.3, # Volume must be above average to confirm
+    "entry_window_minutes": 30, # Only fire within first 30 min of market open
+    "time_filter": True,
+}
+
+RISK = {
     "take_profit_pct": 1.5,
     "stop_loss_pct": 0.75,
-    "position_size_with_trend": 0.25,    # 25% when trading with regime
-    "position_size_against_trend": 0.125, # 12.5% when trading against regime
-    "max_long_positions": 4,              # SPY, QQQ, GLD, SQQQ simultaneously
-    "max_short_positions": 2,             # Up to 2 shorts (SPY + QQQ)
-    # Short rules — 1 hour candle lockout (no 24hr, no PDT)
-    "short_lockout_minutes": 60,          # Wait for next full 1H candle after closing short
-    "last_short_entry_hour_et": 14,       # No new shorts after 2PM ET
-    "force_close_hour_et": 15,            # Force close all same-day positions at 3:55PM ET
+    "position_size_with_trend": 0.25,
+    "position_size_against_trend": 0.125,
+    "max_long_positions": 4,
+    "max_short_positions": 2,
+    "short_lockout_minutes": 60,
+    "last_short_entry_hour_et": 14,
+    "force_close_hour_et": 15,
     "force_close_minute_et": 55,
-    # VIX filter
-    "vix_max": 30,                        # No trades if VIX above 30
-    "vix_reduce_threshold": 20,           # Reduce size if VIX above 20
-    # Signal thresholds
+    "vix_max": 30,
+    "vix_reduce_threshold": 20,
     "min_score_long": 4,
-    "min_score_short_bull": 4,            # Score needed to short in BULL regime
-    "min_score_short_bear": 3,            # Lower threshold in BEAR regime
-    # Cooldown
-    "cooldown_minutes": 30,
-    # Symbol rules
-    "long_only": ["GLD", "SQQQ"],        # GLD and SQQQ are long only
-    "short_eligible": ["SPY", "QQQ"],     # Only SPY and QQQ can be shorted
+    "min_score_short_bull": 4,
+    "min_score_short_bear": 3,
+    "long_only": LONG_ONLY,
+    "short_eligible": SHORT_ELIG,
+    "cooldown_minutes": 20,
 }
- 
+
 bot_state = {
     "running": True, "killed": False,
-    "positions": {},                      # symbol -> position dict
-    "long_positions": {},                 # symbol -> long position
-    "short_positions": {},                # symbol -> short position
+    "positions": {},
+    "strategy_positions": {s: None for s in STRATEGIES},
     "closed_trades": [], "diary": [],
     "day_pnl": 0.0, "daily_start_equity": 0.0,
     "total_trades": 0, "win_count": 0,
-    "long_stats": {"trades": 0, "wins": 0, "pnl": 0.0},
+    "strategy_stats": {s: {"trades": 0, "wins": 0, "pnl": 0.0} for s in STRATEGIES},
+    "long_stats":  {"trades": 0, "wins": 0, "pnl": 0.0},
     "short_stats": {"trades": 0, "wins": 0, "pnl": 0.0},
-    "signals": {s: {} for s in ["SPY", "QQQ", "GLD", "SQQQ"]},
+    "signals": {s: {} for s in SYMBOLS},
     "account_cash": 0.0, "account_equity": 0.0, "account_buying_power": 0.0,
-    "market_regime": "UNKNOWN",           # Based on SPY 200 EMA
-    "vix": 0.0,
-    "vix_status": "UNKNOWN",
-    "short_lockouts": {},                 # symbol -> datetime of last short close (1H candle lockout)
+    "market_regime": "UNKNOWN",
+    "vix": 0.0, "vix_status": "UNKNOWN",
+    "short_lockouts": {},
     "active_cooldowns": {},
     "market_open": False,
     "in_trading_window": False,
     "daily_paused": False,
-    "version": "ETF-1.2"
+    "prev_closes": {},       # Previous day closes for gap detection
+    "gap_fired_today": {},   # Track gap signals already fired today
+    "mss_last_signal_time": {s: None for s in SYMBOLS},
+    "version": "ETF-2.0"
 }
- 
+
 # ── Alpaca helpers ─────────────────────────────────────────────────────────────
 def get_trading_client():
     from alpaca.trading.client import TradingClient
     return TradingClient(api_key=API_KEY, secret_key=API_SECRET, paper=PAPER_MODE)
- 
+
 def get_data_client():
     from alpaca.data.historical import StockHistoricalDataClient
     return StockHistoricalDataClient(api_key=API_KEY, secret_key=API_SECRET)
- 
+
 def get_bars(symbol, timeframe="5Min", limit=100):
     try:
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
         client = get_data_client()
-        if timeframe == "1Min":
-            tf = TimeFrame(1, TimeFrameUnit.Minute)
-        elif timeframe == "5Min":
-            tf = TimeFrame(5, TimeFrameUnit.Minute)
-        elif timeframe == "1Hour":
-            tf = TimeFrame(1, TimeFrameUnit.Hour)
-        elif timeframe == "1Day":
-            tf = TimeFrame(1, TimeFrameUnit.Day)
-        else:
-            tf = TimeFrame(5, TimeFrameUnit.Minute)
- 
+        tf_map = {
+            "1Min":  TimeFrame(1, TimeFrameUnit.Minute),
+            "5Min":  TimeFrame(5, TimeFrameUnit.Minute),
+            "15Min": TimeFrame(15, TimeFrameUnit.Minute),
+            "1Hour": TimeFrame(1, TimeFrameUnit.Hour),
+            "1Day":  TimeFrame(1, TimeFrameUnit.Day),
+        }
+        tf = tf_map.get(timeframe, TimeFrame(5, TimeFrameUnit.Minute))
         end = datetime.now(timezone.utc)
         if timeframe == "1Day":
             start = end - timedelta(days=limit + 10)
         elif timeframe == "1Hour":
             start = end - timedelta(hours=limit + 5)
+        elif timeframe == "15Min":
+            start = end - timedelta(minutes=limit * 20)
         else:
             start = end - timedelta(minutes=limit * 6)
- 
         req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=tf,
-                               start=start, limit=limit,
-                               feed="iex")
-        bars = client.get_stock_bars(req)
+                               start=start, limit=limit, feed="iex")
+        bars = get_data_client().get_stock_bars(req)
         df = bars.df
         if df.empty:
             return []
@@ -121,9 +170,9 @@ def get_bars(symbol, timeframe="5Min", limit=100):
             })
         return result[-limit:]
     except Exception as e:
-        log.error(f"Bars error {symbol}: {e}")
+        log.error(f"Bars error {symbol} {timeframe}: {e}")
         return []
- 
+
 def refresh_account():
     try:
         tc = get_trading_client()
@@ -135,41 +184,45 @@ def refresh_account():
             bot_state["daily_start_equity"] = float(acct.equity)
     except Exception as e:
         log.error(f"Account refresh error: {e}")
- 
+
 def sync_positions():
     try:
         tc = get_trading_client()
         positions = tc.get_all_positions()
         synced = {}
+        active_symbols = set()
         for p in positions:
             sym = p.symbol
             if sym not in SYMBOLS:
                 continue
+            active_symbols.add(sym)
             qty = float(p.qty)
+            existing = bot_state["positions"].get(sym, {})
             synced[sym] = {
-                "symbol": sym,
-                "entry": float(p.avg_entry_price),
-                "qty": abs(qty),
-                "side": "short" if qty < 0 else "long",
+                "symbol": sym, "entry": float(p.avg_entry_price),
+                "qty": abs(qty), "side": "short" if qty < 0 else "long",
                 "current_price": float(p.current_price),
                 "unrealized_pnl": float(p.unrealized_pl),
-                "open_time": bot_state["positions"].get(sym, {}).get("open_time",
-                             datetime.now(timezone.utc).isoformat()),
-                "open_date": bot_state["positions"].get(sym, {}).get("open_date",
-                             datetime.now(timezone.utc).date().isoformat())
+                "open_time": existing.get("open_time", datetime.now(timezone.utc).isoformat()),
+                "open_date": existing.get("open_date", get_et_time().date().isoformat()),
+                "strategy": existing.get("strategy", "UNKNOWN")
             }
+        # Clear strategy slots for closed positions
+        for strat in STRATEGIES:
+            held = bot_state["strategy_positions"].get(strat)
+            if held and held not in active_symbols:
+                bot_state["strategy_positions"][strat] = None
         bot_state["positions"] = synced
     except Exception as e:
         log.error(f"Sync positions error: {e}")
- 
+
 def place_order(symbol, qty, side):
     try:
         from alpaca.trading.requests import MarketOrderRequest
         from alpaca.trading.enums import OrderSide, TimeInForce
         tc = get_trading_client()
         req = MarketOrderRequest(
-            symbol=symbol,
-            qty=round(qty, 2),
+            symbol=symbol, qty=round(qty, 2),
             side=OrderSide.BUY if side == "BUY" else OrderSide.SELL,
             time_in_force=TimeInForce.DAY
         )
@@ -177,8 +230,8 @@ def place_order(symbol, qty, side):
     except Exception as e:
         log.error(f"Order error {symbol} {side}: {e}")
         return None
- 
-def close_position(symbol, side):
+
+def close_position_alpaca(symbol):
     try:
         tc = get_trading_client()
         tc.close_position(symbol)
@@ -186,16 +239,81 @@ def close_position(symbol, side):
     except Exception as e:
         log.error(f"Close error {symbol}: {e}")
         return False
- 
-def add_diary(symbol, text, entry_type="info"):
+
+def add_diary(symbol, text, entry_type="info", strategy="SYSTEM"):
+    label = f"[{strategy}] " if strategy != "SYSTEM" else ""
     entry = {
         "time": datetime.now(timezone.utc).strftime("%H:%M"),
-        "symbol": symbol, "text": text, "type": entry_type
+        "symbol": symbol, "text": f"{label}{text}",
+        "type": entry_type, "strategy": strategy
     }
     bot_state["diary"].insert(0, entry)
-    if len(bot_state["diary"]) > 200:
-        bot_state["diary"] = bot_state["diary"][:200]
- 
+    if len(bot_state["diary"]) > 300:
+        bot_state["diary"] = bot_state["diary"][:300]
+
+# ── Time helpers ───────────────────────────────────────────────────────────────
+def get_et_time():
+    try:
+        import zoneinfo
+        return datetime.now(zoneinfo.ZoneInfo("America/New_York"))
+    except ImportError:
+        try:
+            import pytz
+            return datetime.now(pytz.utc).astimezone(pytz.timezone("America/New_York"))
+        except ImportError:
+            utc_now = datetime.now(timezone.utc)
+            et_offset = -4 if 3 <= utc_now.month <= 11 else -5
+            return utc_now + timedelta(hours=et_offset)
+
+def is_market_open():
+    et = get_et_time()
+    if et.weekday() >= 5:
+        return False
+    mins = et.hour * 60 + et.minute
+    return 570 <= mins < 960  # 9:30AM to 4:00PM
+
+def is_trading_window():
+    et = get_et_time()
+    if et.weekday() >= 5:
+        return False
+    mins = et.hour * 60 + et.minute
+    return 570 <= mins < 930  # 9:30AM to 3:30PM
+
+def can_open_short():
+    et = get_et_time()
+    if et.weekday() >= 5:
+        return False
+    mins = et.hour * 60 + et.minute
+    return 570 <= mins < 840  # 9:30AM to 2:00PM
+
+def is_within_open_window():
+    """First 30 minutes after market open — for gap detector"""
+    et = get_et_time()
+    if et.weekday() >= 5:
+        return False
+    mins = et.hour * 60 + et.minute
+    return 570 <= mins < 600  # 9:30AM to 10:00AM
+
+def should_force_close():
+    et = get_et_time()
+    return et.hour == 15 and et.minute >= 55 or et.hour >= 16
+
+def is_short_locked_out(symbol):
+    lockout_time = bot_state["short_lockouts"].get(symbol)
+    if not lockout_time:
+        return False
+    minutes_elapsed = (datetime.now(timezone.utc) -
+                      datetime.fromisoformat(lockout_time)).total_seconds() / 60
+    if minutes_elapsed < RISK["short_lockout_minutes"]:
+        return True
+    lockout_dt = datetime.fromisoformat(lockout_time)
+    next_hour = (lockout_dt + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    return datetime.now(timezone.utc) < next_hour
+
+def is_same_day_position(symbol):
+    pos = bot_state["positions"].get(symbol, {})
+    return pos.get("open_date", "") == get_et_time().date().isoformat()
+
 # ── Indicators ─────────────────────────────────────────────────────────────────
 def calc_ema(prices, period):
     if len(prices) < period:
@@ -205,21 +323,19 @@ def calc_ema(prices, period):
     for p in prices[period:]:
         ema.append(p * k + ema[-1] * (1 - k))
     return ema
- 
+
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1:
         return 50.0
     gains, losses = [], []
     for i in range(1, len(closes)):
         d = closes[i] - closes[i-1]
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
+        gains.append(max(d, 0)); losses.append(max(-d, 0))
     ag = sum(gains[-period:]) / period
     al = sum(losses[-period:]) / period
-    if al == 0:
-        return 100.0
+    if al == 0: return 100.0
     return 100 - (100 / (1 + ag/al))
- 
+
 def calc_bb(closes, period=20, std_dev=2.0):
     if len(closes) < period:
         return None, None, None
@@ -227,7 +343,7 @@ def calc_bb(closes, period=20, std_dev=2.0):
     mid = sum(window) / period
     std = math.sqrt(sum((x-mid)**2 for x in window) / period)
     return mid - std_dev*std, mid, mid + std_dev*std
- 
+
 def calc_atr(bars, period=14):
     if len(bars) < period + 1:
         return 0.0
@@ -236,593 +352,800 @@ def calc_atr(bars, period=14):
         h = bars[i]["high"]; l = bars[i]["low"]; pc = bars[i-1]["close"]
         trs.append(max(h-l, abs(h-pc), abs(l-pc)))
     return sum(trs[-period:]) / period if len(trs) >= period else sum(trs)/len(trs)
- 
-# ── Market state ───────────────────────────────────────────────────────────────
-def get_et_time():
-    """Get current Eastern Time"""
-    from datetime import timezone as tz
-    utc_now = datetime.now(timezone.utc)
-    # ET is UTC-5 (EST) or UTC-4 (EDT)
-    # Simple approximation — use UTC-4 for EDT (March-November)
-    et_offset = -4
-    et_now = utc_now + timedelta(hours=et_offset)
-    return et_now
- 
-def is_market_open():
-    """US stock market hours: 9:30AM - 4:00PM ET, Mon-Fri"""
-    et = get_et_time()
-    wd = et.weekday()  # 0=Mon, 4=Fri, 5=Sat, 6=Sun
-    if wd >= 5:
-        log.info(f"Market closed — weekend (weekday={wd})")
-        return False
-    market_open_mins  = 9 * 60 + 30   # 9:30AM
-    market_close_mins = 16 * 60        # 4:00PM
-    current_mins = et.hour * 60 + et.minute
-    is_open = market_open_mins <= current_mins < market_close_mins
-    log.info(f"Market check | ET={et.strftime('%H:%M')} | mins={current_mins} | open={is_open} | wd={wd}")
-    return is_open
- 
-def is_trading_window():
-    """Can open new positions: 9:30AM - 3:30PM ET"""
-    et = get_et_time()
-    wd = et.weekday()
-    if wd >= 5:
-        return False
-    open_mins  = 9 * 60 + 30   # 9:30AM
-    close_mins = 15 * 60 + 30  # 3:30PM
-    current_mins = et.hour * 60 + et.minute
-    return open_mins <= current_mins < close_mins
- 
-def can_open_short():
-    """Can open new shorts: 9:30AM - 2:00PM ET"""
-    et = get_et_time()
-    wd = et.weekday()
-    if wd >= 5:
-        return False
-    open_mins  = 9 * 60 + 30   # 9:30AM
-    close_mins = 14 * 60        # 2:00PM
-    current_mins = et.hour * 60 + et.minute
-    return open_mins <= current_mins < close_mins
- 
-def should_force_close():
-    """Force close same-day positions at 3:55PM ET"""
-    et = get_et_time()
-    return et.hour == 15 and et.minute >= 55 or et.hour >= 16
- 
-def get_week_start():
-    """Get Monday of current week"""
-    et = get_et_time()
-    days_since_monday = et.weekday()
-    monday = et - timedelta(days=days_since_monday)
-    return monday.date()
- 
-def check_and_reset_day_trades():
-    """PDT rules removed as of June 4 2026 — no-op"""
-    pass
- 
-def is_short_locked_out(symbol):
-    """Check 1H candle lockout — wait for next full hour candle after closing short"""
-    lockout_time = bot_state["short_lockouts"].get(symbol)
-    if not lockout_time:
-        return False
-    minutes_elapsed = (datetime.now(timezone.utc) -
-                      datetime.fromisoformat(lockout_time)).total_seconds() / 60
-    # Wait until the next full hour candle has started
-    # i.e. at least 60 minutes AND we are in a new hour
-    if minutes_elapsed < STRATEGY["short_lockout_minutes"]:
-        return True
-    # Also check we are past the next hour boundary
-    lockout_dt = datetime.fromisoformat(lockout_time)
-    next_hour = (lockout_dt + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-    return datetime.now(timezone.utc) < next_hour
- 
-def is_same_day_short(symbol):
-    """Check if current short was opened today (kept for force-close logic)"""
-    pos = bot_state["positions"].get(symbol, {})
-    if pos.get("side") != "short":
-        return False
-    open_date = pos.get("open_date", "")
-    today = get_et_time().date().isoformat()
-    return open_date == today
- 
+
+# ── Market regime & VIX ────────────────────────────────────────────────────────
 def check_market_regime():
-    """SPY 200-day EMA as market regime"""
     try:
         bars = get_bars("SPY", "1Day", 210)
-        if len(bars) < 200:
-            return "UNKNOWN"
+        if len(bars) < 200: return "UNKNOWN"
         closes = [b["close"] for b in bars]
         ema200 = calc_ema(closes, 200)
-        if not ema200:
-            return "UNKNOWN"
+        if not ema200: return "UNKNOWN"
         regime = "BULL" if closes[-1] > ema200[-1] else "BEAR"
-        log.info(f"Market regime: {regime} | SPY={closes[-1]:.2f} | 200EMA={ema200[-1]:.2f}")
+        log.info(f"Regime: {regime} | SPY={closes[-1]:.2f} | 200EMA={ema200[-1]:.2f}")
         return regime
     except Exception as e:
-        log.error(f"Regime check error: {e}")
-        return "UNKNOWN"
- 
+        log.error(f"Regime error: {e}"); return "UNKNOWN"
+
 def get_vix():
-    """Get VIX level"""
     try:
-        bars = get_bars("VIXY", "1Day", 3)  # VIXY is VIX ETF on Alpaca
-        if bars:
-            vix = bars[-1]["close"]
-            log.info(f"VIX proxy (VIXY): {vix:.2f}")
-            return vix
-        return 15.0  # Default to calm if can't fetch
-    except Exception as e:
-        log.error(f"VIX error: {e}")
+        bars = get_bars("VIXY", "1Day", 3)
+        return bars[-1]["close"] if bars else 15.0
+    except:
         return 15.0
- 
-# ── Signal generation ──────────────────────────────────────────────────────────
-def generate_signal(symbol):
-    """Generate long and short signals for SPY/QQQ"""
+
+def get_position_size(symbol, side, regime):
+    """Calculate position size based on regime, VIX, and symbol type"""
+    vix = bot_state["vix"]
+    if side == "long":
+        with_trend = regime == "BULL" or symbol in ["GLD"]
+    else:
+        with_trend = regime == "BEAR"
+
+    # SQQQ benefits from bear regime
+    if symbol == "SQQQ":
+        with_trend = regime == "BEAR"
+
+    size = RISK["position_size_with_trend"] if with_trend else RISK["position_size_against_trend"]
+
+    # VIX adjustment
+    if vix > RISK["vix_reduce_threshold"]:
+        size = size * 0.5
+
+    return size
+
+def can_enter(symbol, strategy, side):
+    if bot_state["killed"]: return False, "Kill switch"
+    if bot_state["daily_paused"]: return False, "Daily loss limit"
+    if bot_state["vix"] > RISK["vix_max"]: return False, f"VIX too high {bot_state['vix']}"
+
+    # Strategy slot check
+    if bot_state["strategy_positions"].get(strategy):
+        return False, f"{strategy} already has position"
+
+    # Symbol already held
+    if symbol in bot_state["positions"]:
+        return False, f"{symbol} already held"
+
+    if side == "long":
+        longs = [p for p in bot_state["positions"].values() if p["side"] == "long"]
+        if len(longs) >= RISK["max_long_positions"]:
+            return False, "Max long positions"
+    else:
+        if symbol in LONG_ONLY: return False, f"{symbol} is long only"
+        shorts = [p for p in bot_state["positions"].values() if p["side"] == "short"]
+        if len(shorts) >= RISK["max_short_positions"]:
+            return False, "Max short positions"
+        if is_short_locked_out(symbol): return False, "Short lockout active"
+        if not can_open_short(): return False, "After 2PM ET"
+
+    return True, "OK"
+
+# ── STRATEGY A: EMA ────────────────────────────────────────────────────────────
+def run_ema(symbol, regime):
     try:
         bars_5m = get_bars(symbol, "5Min", 80)
         bars_1h = get_bars(symbol, "1Hour", 60)
-        if len(bars_5m) < 30 or len(bars_1h) < 30:
-            return {}
- 
+        if len(bars_5m) < 30 or len(bars_1h) < 20: return {}
+
         closes_5m = [b["close"] for b in bars_5m]
         closes_1h = [b["close"] for b in bars_1h]
         volumes   = [b["volume"] for b in bars_5m]
         price     = closes_5m[-1]
- 
-        # Stale data check
-        if all(v == 0 for v in volumes[-5:]):
-            return {}
- 
-        ema9  = calc_ema(closes_5m, 9)
-        ema21 = calc_ema(closes_5m, 21)
-        ema50 = calc_ema(closes_5m, 50)
+
+        if all(v == 0 for v in volumes[-5:]): return {}
+
+        ema9   = calc_ema(closes_5m, 9)
+        ema21  = calc_ema(closes_5m, 21)
+        ema50  = calc_ema(closes_5m, 50)
         ema20_1h = calc_ema(closes_1h, 20)
         ema50_1h = calc_ema(closes_1h, 50)
-        rsi   = calc_rsi(closes_5m)
+        rsi      = calc_rsi(closes_5m)
         rsi_prev = calc_rsi(closes_5m[:-2])
         bb_low, bb_mid, bb_high = calc_bb(closes_5m)
-        atr   = calc_atr(bars_5m)
-        avg_atr = calc_atr(bars_5m[:-10]) if len(bars_5m) > 15 else atr
- 
-        if not ema9 or not ema21 or not ema50 or not ema20_1h or bb_mid is None:
-            return {}
- 
-        bb_bw = ((bb_high - bb_low) / bb_mid) * 100 if bb_mid > 0 else 0
-        avg_vol = sum(volumes[-20:]) / 20
+        atr      = calc_atr(bars_5m)
+        avg_atr  = calc_atr(bars_5m[:-10]) if len(bars_5m) > 15 else atr
+
+        if not ema9 or not ema21 or not ema50_1h or bb_mid is None: return {}
+
+        bb_bw     = ((bb_high - bb_low) / bb_mid) * 100 if bb_mid > 0 else 0
+        avg_vol   = sum(volumes[-20:]) / 20
         vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0
         rsi_rising  = rsi > rsi_prev
         rsi_falling = rsi < rsi_prev
- 
-        # ATR filter — skip if market too quiet
-        atr_ok = avg_atr == 0 or atr >= avg_atr * 0.7
- 
-        # ── LONG score ──────────────────────────────────────────────────────
+        atr_ok = avg_atr == 0 or atr >= avg_atr * EMA_CONFIG["atr_min_mult"]
+
+        # RSI hard gate for longs
+        long_blocked = rsi > EMA_CONFIG["rsi_hard_gate"]
+        short_blocked = rsi < (100 - EMA_CONFIG["rsi_hard_gate"])
+
         long_score = 0
-        if price > ema50_1h[-1]:             long_score += 1  # Above 1H 50 EMA
-        if price > ema20_1h[-1]:             long_score += 1  # Above 1H 20 EMA
-        if ema9[-1] > ema21[-1]:             long_score += 2  # 5M EMA bullish
-        if len(ema9) > 1 and ema9[-1] > ema21[-1] and ema9[-2] <= ema21[-2]:
-            long_score += 1                                    # Fresh crossover
-        if rsi < 40 and rsi_rising:          long_score += 2  # Oversold + rising
-        elif rsi < 50 and rsi_rising:        long_score += 1  # Rising momentum
-        if bb_bw > 0.3 and price < bb_low:  long_score += 1  # Below lower BB
-        if vol_ratio >= 1.5:                 long_score += 1  # Volume confirmation
- 
-        # ── SHORT score ─────────────────────────────────────────────────────
+        if not long_blocked:
+            if price > ema50_1h[-1]:              long_score += 1
+            if price > ema20_1h[-1]:              long_score += 1
+            if ema9[-1] > ema21[-1]:              long_score += 2
+            if len(ema9) > 1 and ema9[-1] > ema21[-1] and ema9[-2] <= ema21[-2]:
+                long_score += 1
+            if rsi < 40 and rsi_rising:           long_score += 2
+            elif rsi < 50 and rsi_rising:         long_score += 1
+            if bb_bw > EMA_CONFIG["bb_min_bw"] and price < bb_low:
+                long_score += 1
+            if vol_ratio >= EMA_CONFIG["volume_bonus_mult"]:
+                long_score += 1
+
         short_score = 0
-        if price < ema50_1h[-1]:             short_score += 1  # Below 1H 50 EMA
-        if price < ema20_1h[-1]:             short_score += 1  # Below 1H 20 EMA
-        if ema9[-1] < ema21[-1]:             short_score += 2  # 5M EMA bearish
-        if len(ema9) > 1 and ema9[-1] < ema21[-1] and ema9[-2] >= ema21[-2]:
-            short_score += 1                                    # Fresh bearish crossover
-        if rsi > 60 and rsi_falling:         short_score += 2  # Overbought + falling
-        elif rsi > 50 and rsi_falling:       short_score += 1  # Falling momentum
-        if bb_bw > 0.3 and price > bb_high:  short_score += 1  # Above upper BB
-        if vol_ratio >= 1.5:                 short_score += 1  # Volume confirmation
- 
+        if not short_blocked:
+            if price < ema50_1h[-1]:              short_score += 1
+            if price < ema20_1h[-1]:              short_score += 1
+            if ema9[-1] < ema21[-1]:              short_score += 2
+            if len(ema9) > 1 and ema9[-1] < ema21[-1] and ema9[-2] >= ema21[-2]:
+                short_score += 1
+            if rsi > 60 and rsi_falling:          short_score += 2
+            elif rsi > 50 and rsi_falling:        short_score += 1
+            if bb_bw > EMA_CONFIG["bb_min_bw"] and price > bb_high:
+                short_score += 1
+            if vol_ratio >= EMA_CONFIG["volume_bonus_mult"]:
+                short_score += 1
+
         sig = {
-            "price": price, "rsi": round(rsi, 1),
+            "price": price, "rsi": round(rsi,1),
             "rsi_rising": rsi_rising, "rsi_falling": rsi_falling,
-            "bb_bw": round(bb_bw, 2), "vol_ratio": round(vol_ratio, 2),
-            "atr": round(atr, 4), "atr_ok": atr_ok,
-            "ema9": round(ema9[-1], 2), "ema21": round(ema21[-1], 2),
-            "ema50_1h": round(ema50_1h[-1], 2),
-            "long_score": long_score, "short_score": short_score,
+            "bb_bw": round(bb_bw,2), "vol_ratio": round(vol_ratio,2),
+            "atr_ok": atr_ok, "long_score": long_score, "short_score": short_score,
+            "ema9": round(ema9[-1],2), "ema21": round(ema21[-1],2),
+            "ema50_1h": round(ema50_1h[-1],2), "strategy": "EMA"
         }
-        bot_state["signals"][symbol] = sig
-        log.info(f"{symbol} | price={price} RSI={round(rsi,1)} "
-                 f"LONG={long_score} SHORT={short_score} vol={round(vol_ratio,1)}x")
+        log.info(f"[EMA] {symbol} | price={price} RSI={round(rsi,1)} L={long_score} S={short_score}")
         return sig
- 
     except Exception as e:
-        log.error(f"Signal error {symbol}: {e}")
-        return {}
- 
-# ── Exit handler ───────────────────────────────────────────────────────────────
-def check_exits(symbol, price, now, et_now, force_close=False):
+        log.error(f"[EMA] error {symbol}: {e}"); return {}
+
+# ── STRATEGY B: MSS ────────────────────────────────────────────────────────────
+def run_mss(symbol, regime):
+    try:
+        bars_5m = get_bars(symbol, "5Min", 80)
+        bars_1h = get_bars(symbol, "1Hour", 30)
+        if len(bars_5m) < 20 or len(bars_1h) < 15: return {}
+
+        closes_5m = [b["close"] for b in bars_5m]
+        closes_1h = [b["close"] for b in bars_1h]
+        highs_1h  = [b["high"]  for b in bars_1h]
+        lows_1h   = [b["low"]   for b in bars_1h]
+        highs_5m  = [b["high"]  for b in bars_5m]
+        lows_5m   = [b["low"]   for b in bars_5m]
+        volumes   = [b["volume"] for b in bars_5m]
+        price     = closes_5m[-1]
+
+        if all(v == 0 for v in volumes[-5:]): return {}
+
+        rsi     = calc_rsi(closes_5m)
+        atr     = calc_atr(bars_5m)
+        avg_atr = calc_atr(bars_5m[:-10]) if len(bars_5m) > 15 else atr
+        avg_vol = sum(volumes[-20:]) / 20
+        vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0
+        atr_ok = avg_atr == 0 or atr >= avg_atr * MSS_CONFIG["atr_min_mult"]
+
+        # 1H trend
+        rh = highs_1h[-5:]; ph = highs_1h[-10:-5]
+        rl = lows_1h[-5:];  pl = lows_1h[-10:-5]
+        trend_1h = "NEUTRAL"
+        if rh and ph and rl and pl:
+            if max(rh) > max(ph) and min(rl) > min(pl): trend_1h = "BULL"
+            elif max(rh) < max(ph) and min(rl) < min(pl): trend_1h = "BEAR"
+
+        # MSS lookback with fallback
+        last_sig = bot_state["mss_last_signal_time"].get(symbol)
+        if last_sig:
+            hrs = (datetime.now(timezone.utc) - last_sig).total_seconds() / 3600
+            lookback = MSS_CONFIG["swing_fallback"] if hrs > MSS_CONFIG["fallback_hours"] else MSS_CONFIG["swing_lookback"]
+        else:
+            lookback = MSS_CONFIG["swing_lookback"]
+
+        recent_lows = lows_5m[-lookback:]
+        recent_highs = highs_5m[-lookback:]
+
+        # Bullish MSS: lower lows then higher low (reversal)
+        bull_mss = (len(recent_lows) >= 5 and
+                    recent_lows[-3] < recent_lows[-5] and
+                    recent_lows[-1] > recent_lows[-2])
+
+        # Bearish MSS: higher highs then lower high (reversal)
+        bear_mss = (len(recent_highs) >= 5 and
+                    recent_highs[-3] > recent_highs[-5] and
+                    recent_highs[-1] < recent_highs[-2])
+
+        if bull_mss or bear_mss:
+            bot_state["mss_last_signal_time"][symbol] = datetime.now(timezone.utc)
+
+        long_score = 0
+        if bull_mss and trend_1h == "BULL":
+            long_score += 3
+            if rsi < MSS_CONFIG["rsi_soft_threshold"]: long_score += 1
+            if vol_ratio >= MSS_CONFIG["volume_bonus_mult"]: long_score += 1
+
+        short_score = 0
+        if bear_mss and trend_1h == "BEAR":
+            short_score += 3
+            if rsi > (100 - MSS_CONFIG["rsi_soft_threshold"]): short_score += 1
+            if vol_ratio >= MSS_CONFIG["volume_bonus_mult"]: short_score += 1
+
+        sig = {
+            "price": price, "trend_1h": trend_1h,
+            "bull_mss": bull_mss, "bear_mss": bear_mss,
+            "rsi": round(rsi,1), "vol_ratio": round(vol_ratio,2),
+            "atr_ok": atr_ok, "lookback": lookback,
+            "long_score": long_score, "short_score": short_score,
+            "strategy": "MSS"
+        }
+        log.info(f"[MSS] {symbol} | trend={trend_1h} bullMSS={bull_mss} bearMSS={bear_mss} L={long_score} S={short_score}")
+        return sig
+    except Exception as e:
+        log.error(f"[MSS] error {symbol}: {e}"); return {}
+
+# ── STRATEGY C: VPA ────────────────────────────────────────────────────────────
+def run_vpa(symbol, regime):
+    try:
+        bars = get_bars(symbol, "5Min", 40)
+        if len(bars) < 25: return {}
+
+        volumes = [b["volume"] for b in bars]
+        closes  = [b["close"]  for b in bars]
+        opens   = [b["open"]   for b in bars]
+        highs   = [b["high"]   for b in bars]
+        lows    = [b["low"]    for b in bars]
+
+        if all(v == 0 for v in volumes[-5:]): return {}
+
+        avg_vol    = sum(volumes[-VPA_CONFIG["volume_avg_period"]:]) / VPA_CONFIG["volume_avg_period"]
+        curr_vol   = volumes[-1]
+        vol_ratio  = curr_vol / avg_vol if avg_vol > 0 else 0
+        price      = closes[-1]
+        curr_open  = opens[-1]
+        curr_close = closes[-1]
+        curr_high  = highs[-1]
+        curr_low   = lows[-1]
+        bar_range  = curr_high - curr_low
+
+        if bar_range == 0: return {}
+
+        close_ratio = (curr_close - curr_low) / bar_range
+        price_move  = bar_range / price if price > 0 else 0
+        ema20 = calc_ema(closes, 20)
+
+        long_score  = 0
+        short_score = 0
+        long_signals  = []
+        short_signals = []
+
+        # Bullish volume spike
+        if vol_ratio >= VPA_CONFIG["volume_spike_mult"]:
+            if close_ratio >= VPA_CONFIG["min_close_ratio"]:
+                long_score += 2; long_signals.append("VOL_SPIKE_BULL")
+            elif close_ratio <= (1 - VPA_CONFIG["min_close_ratio"]):
+                short_score += 2; short_signals.append("VOL_SPIKE_BEAR")
+
+        # Absorption
+        if vol_ratio >= 2.5 and price_move < VPA_CONFIG["effort_result_ratio"]:
+            if curr_close > curr_open:
+                long_score += 2; long_signals.append("ABSORPTION_BULL")
+            else:
+                short_score += 2; short_signals.append("ABSORPTION_BEAR")
+
+        # No supply / no demand
+        if vol_ratio < 0.7 and curr_close > curr_open and close_ratio > 0.5:
+            long_score += 1; long_signals.append("NO_SUPPLY")
+        if vol_ratio < 0.7 and curr_close < curr_open and close_ratio < 0.5:
+            short_score += 1; short_signals.append("NO_DEMAND")
+
+        # Trend bonus
+        if ema20 and price > ema20[-1]: long_score += 1
+        if ema20 and price < ema20[-1]: short_score += 1
+
+        sig = {
+            "price": price, "vol_ratio": round(vol_ratio,2),
+            "close_ratio": round(close_ratio,2),
+            "long_score": long_score, "short_score": short_score,
+            "long_signals": long_signals, "short_signals": short_signals,
+            "strategy": "VPA"
+        }
+        log.info(f"[VPA] {symbol} | vol={round(vol_ratio,2)}x L={long_score} S={short_score} sigs={long_signals+short_signals}")
+        return sig
+    except Exception as e:
+        log.error(f"[VPA] error {symbol}: {e}"); return {}
+
+# ── STRATEGY D: BREAKOUT ───────────────────────────────────────────────────────
+def run_breakout(symbol, regime):
+    try:
+        bars = get_bars(symbol, "5Min", 40)
+        if len(bars) < 14: return {}
+
+        closes  = [b["close"]  for b in bars]
+        highs   = [b["high"]   for b in bars]
+        lows    = [b["low"]    for b in bars]
+        volumes = [b["volume"] for b in bars]
+        opens   = [b["open"]   for b in bars]
+
+        if all(v == 0 for v in volumes[-5:]): return {}
+
+        price      = closes[-1]
+        curr_open  = opens[-1]
+        curr_close = closes[-1]
+        curr_high  = highs[-1]
+        curr_low   = lows[-1]
+        curr_vol   = volumes[-1]
+        avg_vol    = sum(volumes[-20:]) / len(volumes[-20:]) if volumes[-20:] else 1
+        vol_ratio  = curr_vol / avg_vol if avg_vol > 0 else 0
+
+        lookback = BREAKOUT_CONFIG["consolidation_candles"]
+        if len(bars) < lookback + 2: return {}
+
+        consol     = bars[-(lookback+2):-2]
+        c_highs    = [b["high"] for b in consol]
+        c_lows     = [b["low"]  for b in consol]
+        c_high     = max(c_highs)
+        c_low      = min(c_lows)
+        c_range_pct = (c_high - c_low) / price * 100 if price > 0 else 0
+        in_consol  = c_range_pct <= BREAKOUT_CONFIG["consolidation_threshold"]
+
+        bar_range   = curr_high - curr_low
+        close_ratio = (curr_close - curr_low) / bar_range if bar_range > 0 else 0
+        bull_bo_pct = (curr_close - c_high) / c_high * 100 if c_high > 0 else 0
+        bear_bo_pct = (c_low - curr_close) / c_low * 100 if c_low > 0 else 0
+
+        # Confirmation candle
+        prev = bars[-2] if len(bars) >= 2 else None
+        prev_bull_confirmed = False
+        prev_bear_confirmed = False
+        if prev:
+            pr = prev["high"] - prev["low"]
+            if pr > 0:
+                pcr = (prev["close"] - prev["low"]) / pr
+                prev_bull_confirmed = prev["close"] > c_high and pcr >= 0.5
+                prev_bear_confirmed = prev["close"] < c_low and pcr <= 0.5
+
+        bull_breakout = (in_consol and curr_close > c_high and
+                        bull_bo_pct >= BREAKOUT_CONFIG["min_breakout_pct"] and
+                        vol_ratio >= BREAKOUT_CONFIG["breakout_volume_mult"] and
+                        close_ratio >= BREAKOUT_CONFIG["breakout_candle_close_ratio"] and
+                        prev_bull_confirmed)
+
+        bear_breakout = (in_consol and curr_close < c_low and
+                        bear_bo_pct >= BREAKOUT_CONFIG["min_breakout_pct"] and
+                        vol_ratio >= BREAKOUT_CONFIG["breakout_volume_mult"] and
+                        close_ratio <= (1 - BREAKOUT_CONFIG["breakout_candle_close_ratio"]) and
+                        prev_bear_confirmed)
+
+        long_score  = 4 if bull_breakout else 0
+        short_score = 4 if bear_breakout else 0
+
+        sig = {
+            "price": price, "vol_ratio": round(vol_ratio,2),
+            "consol_pct": round(c_range_pct,2), "in_consol": in_consol,
+            "bull_breakout": bull_breakout, "bear_breakout": bear_breakout,
+            "bull_bo_pct": round(bull_bo_pct,2), "bear_bo_pct": round(bear_bo_pct,2),
+            "consol_high": round(c_high,2), "consol_low": round(c_low,2),
+            "long_score": long_score, "short_score": short_score,
+            "strategy": "Breakout"
+        }
+        log.info(f"[Breakout] {symbol} | vol={round(vol_ratio,1)}x consol={round(c_range_pct,2)}% bull={bull_breakout} bear={bear_breakout}")
+        return sig
+    except Exception as e:
+        log.error(f"[Breakout] error {symbol}: {e}"); return {}
+
+# ── STRATEGY E: GAP DETECTOR ───────────────────────────────────────────────────
+def run_gap_detector(symbol, regime):
+    """Only fires within first 30 minutes of market open"""
+    try:
+        if not is_within_open_window():
+            return {}
+
+        # Already fired today for this symbol?
+        today = get_et_time().date().isoformat()
+        if bot_state["gap_fired_today"].get(symbol) == today:
+            return {}
+
+        # Get yesterday's close
+        bars_daily = get_bars(symbol, "1Day", 5)
+        if len(bars_daily) < 2: return {}
+
+        prev_close = bars_daily[-2]["close"]
+        bot_state["prev_closes"][symbol] = prev_close
+
+        # Get today's first 5M candle
+        bars_5m = get_bars(symbol, "5Min", 5)
+        if not bars_5m: return {}
+
+        today_open  = bars_5m[0]["open"]
+        today_price = bars_5m[-1]["close"]
+        curr_vol    = bars_5m[-1]["volume"]
+
+        # Average volume from daily bars
+        avg_vol = sum(b["volume"] for b in bars_daily[-5:]) / len(bars_daily[-5:])
+        # Convert daily avg to per-5min estimate
+        avg_5m_vol = avg_vol / 78  # ~78 five-minute candles per trading day
+        vol_ratio  = curr_vol / avg_5m_vol if avg_5m_vol > 0 else 1
+
+        gap_pct = (today_open - prev_close) / prev_close * 100
+
+        is_gap_up   = gap_pct >= GAP_CONFIG["min_gap_pct"] and gap_pct <= GAP_CONFIG["max_gap_pct"]
+        is_gap_down = gap_pct <= -GAP_CONFIG["min_gap_pct"] and gap_pct >= -GAP_CONFIG["max_gap_pct"]
+        vol_ok = vol_ratio >= GAP_CONFIG["volume_confirm_mult"]
+
+        long_score  = 5 if (is_gap_up and vol_ok) else 0
+        short_score = 5 if (is_gap_down and vol_ok) else 0
+
+        if long_score > 0 or short_score > 0:
+            log.info(f"[Gap] {symbol} | gap={round(gap_pct,2)}% vol={round(vol_ratio,1)}x L={long_score} S={short_score}")
+
+        sig = {
+            "price": today_price,
+            "prev_close": round(prev_close,2),
+            "today_open": round(today_open,2),
+            "gap_pct": round(gap_pct,2),
+            "vol_ratio": round(vol_ratio,2),
+            "is_gap_up": is_gap_up,
+            "is_gap_down": is_gap_down,
+            "vol_ok": vol_ok,
+            "long_score": long_score,
+            "short_score": short_score,
+            "strategy": "Gap"
+        }
+        return sig
+    except Exception as e:
+        log.error(f"[Gap] error {symbol}: {e}"); return {}
+
+# ── EXIT HANDLER ───────────────────────────────────────────────────────────────
+def check_exits(symbol, now, force_close=False):
     pos = bot_state["positions"].get(symbol)
-    if not pos:
-        return
- 
-    entry = pos["entry"]
-    qty   = pos["qty"]
-    side  = pos["side"]
- 
-    if side == "long":
-        pct = (price - entry) / entry * 100
-    else:
-        pct = (entry - price) / entry * 100  # Profit when price falls
- 
+    if not pos: return
+
+    entry    = pos["entry"]
+    qty      = pos["qty"]
+    side     = pos["side"]
+    strategy = pos.get("strategy", "UNKNOWN")
+
+    # Get current price
+    bars = get_bars(symbol, "1Min", 3)
+    if not bars: return
+    price = bars[-1]["close"]
+
+    pct = (price - entry) / entry * 100 if side == "long" else (entry - price) / entry * 100
+
     should_exit = False
     reason = ""
- 
-    # Force close same-day shorts at 3:55PM ET
-    if force_close and side == "short" and is_same_day_short(symbol):
-        should_exit = True
-        reason = "Force close 3:55PM ET"
- 
-    # Take profit
-    elif pct >= STRATEGY["take_profit_pct"]:
-        should_exit = True
-        reason = f"Take profit (+{round(pct,2)}%)"
- 
-    # Stop loss
-    elif pct <= -STRATEGY["stop_loss_pct"]:
-        should_exit = True
-        reason = f"Stop loss ({round(pct,2)}%)"
- 
+
+    if force_close and is_same_day_position(symbol):
+        should_exit = True; reason = "Force close 3:55PM ET"
+    elif pct >= RISK["take_profit_pct"]:
+        should_exit = True; reason = f"Take profit (+{round(pct,2)}%)"
+    elif pct <= -RISK["stop_loss_pct"]:
+        should_exit = True; reason = f"Stop loss ({round(pct,2)}%)"
+        if side == "short":
+            bot_state["short_lockouts"][symbol] = now.isoformat()
+
     if should_exit:
-        success = close_position(symbol, side)
+        success = close_position_alpaca(symbol)
         if success:
             pnl = (price - entry) * qty if side == "long" else (entry - price) * qty
             win = pnl > 0
- 
-            # Track PDT for same-day shorts
-            if side == "short" and is_same_day_short(symbol):
-                bot_state["day_trades_used"] += 1
-                bot_state["short_lockouts"][symbol] = now.isoformat()
-                log.info(f"Short lockout set for {symbol} — next full 1H candle required")
- 
+
             bot_state["day_pnl"] += pnl
             bot_state["total_trades"] += 1
-            if win:
-                bot_state["win_count"] += 1
- 
-            stats_key = "long_stats" if side == "long" else "short_stats"
-            bot_state[stats_key]["trades"] += 1
-            bot_state[stats_key]["pnl"] = round(bot_state[stats_key]["pnl"] + pnl, 2)
-            if win:
-                bot_state[stats_key]["wins"] += 1
- 
-            entry_type = "win" if win else "loss"
+            if win: bot_state["win_count"] += 1
+
+            # Update strategy stats
+            if strategy in bot_state["strategy_stats"]:
+                s = bot_state["strategy_stats"][strategy]
+                s["trades"] += 1; s["pnl"] = round(s["pnl"] + pnl, 2)
+                if win: s["wins"] += 1
+
+            # Update side stats
+            side_key = "long_stats" if side == "long" else "short_stats"
+            s = bot_state[side_key]
+            s["trades"] += 1; s["pnl"] = round(s["pnl"] + pnl, 2)
+            if win: s["wins"] += 1
+
+            # Clear strategy slot
+            for strat, held in list(bot_state["strategy_positions"].items()):
+                if held == symbol:
+                    bot_state["strategy_positions"][strat] = None
+
             add_diary(symbol,
                 f"{'WIN' if win else 'LOSS'} [{side.upper()}] | "
-                f"${entry:.2f} → ${price:.2f} | "
+                f"${entry:.2f}→${price:.2f} | "
                 f"P&L ${round(pnl,2)} ({round(pct,2)}%) | {reason}",
-                entry_type)
- 
+                "win" if win else "loss", strategy)
+
             bot_state["closed_trades"].append({
-                "symbol": symbol, "side": side,
+                "symbol": symbol, "side": side, "strategy": strategy,
                 "entry": entry, "exit": price,
                 "pnl": round(pnl,2), "pct": round(pct,2),
                 "win": win, "reason": reason,
                 "time": now.strftime("%H:%M")
             })
             sync_positions()
- 
-# ── Entry handler ──────────────────────────────────────────────────────────────
-def try_long(symbol, sig, regime, now):
-    """Try to open a long position"""
-    # SQQQ: only buy in BEAR regime (it profits when QQQ falls)
-    if symbol == "SQQQ" and regime != "BEAR":
+
+# ── ENTRY HANDLER ──────────────────────────────────────────────────────────────
+def try_entry(symbol, strategy, sig, regime, side, now):
+    ok, reason = can_enter(symbol, strategy, side)
+    if not ok:
         return
-    # GLD: always allowed long (safe haven)
-    # SPY/QQQ: standard long rules apply
-    min_score = STRATEGY["min_score_long"]
-    # For SQQQ use short score as proxy (SQQQ goes up when market goes down)
-    score = sig.get("short_score", 0) if symbol == "SQQQ" else sig.get("long_score", 0)
-    if not sig or score < min_score:
-        return
-    if not sig.get("atr_ok", True):
-        return
-    if symbol in bot_state["positions"] and bot_state["positions"][symbol]["side"] == "long":
-        return  # Already long this symbol
-    if len([p for p in bot_state["positions"].values() if p["side"] == "long"]) >= STRATEGY["max_long_positions"]:
-        return  # Max long positions reached
-    if bot_state["killed"]:
-        return
-    if not is_trading_window():
-        return
- 
-    # VIX check
-    if bot_state["vix"] > STRATEGY["vix_max"]:
-        return
- 
-    # Position sizing based on regime
-    size = STRATEGY["position_size_with_trend"] if regime != "BEAR" else STRATEGY["position_size_against_trend"]
- 
-    # Reduce size if VIX elevated
-    if bot_state["vix"] > STRATEGY["vix_reduce_threshold"]:
-        size = size * 0.5
- 
+
+    min_score = RISK["min_score_long"] if side == "long" else (
+        RISK["min_score_short_bear"] if regime == "BEAR" else RISK["min_score_short_bull"]
+    )
+    score_key = "long_score" if side == "long" else "short_score"
+    score = sig.get(score_key, 0)
+
+    if score < min_score: return
+    if not sig.get("atr_ok", True) and strategy in ["EMA", "MSS"]: return
+
+    # SQQQ only buys when bearish signals fire
+    if symbol == "SQQQ" and side == "long":
+        if sig.get("short_score", 0) < min_score: return
+
+    # Time window checks
+    if strategy in ["EMA", "MSS"] and not is_trading_window(): return
+    if not is_trading_window() and strategy not in ["VPA", "Breakout", "Gap"]: return
+
+    # Calculate position size
+    size  = get_position_size(symbol, side, regime)
     cash  = bot_state["account_cash"]
     budget = cash * size
     price  = sig["price"]
     qty    = budget / price
- 
-    if budget < 100 or qty < 0.01:
-        return
- 
-    order = place_order(symbol, qty, "BUY")
+
+    if budget < 50 or qty < 0.01: return
+
+    order_side = "BUY" if side == "long" else "SELL"
+    order = place_order(symbol, qty, order_side)
+
     if order:
         bot_state["positions"][symbol] = {
             "symbol": symbol, "entry": price, "qty": qty,
-            "side": "long", "current_price": price, "unrealized_pnl": 0,
+            "side": side, "current_price": price, "unrealized_pnl": 0,
             "open_time": now.isoformat(),
-            "open_date": get_et_time().date().isoformat()
+            "open_date": get_et_time().date().isoformat(),
+            "strategy": strategy
         }
+        bot_state["strategy_positions"][strategy] = symbol
+
+        # Mark gap as fired today
+        if strategy == "Gap":
+            bot_state["gap_fired_today"][symbol] = get_et_time().date().isoformat()
+
         sync_positions()
         add_diary(symbol,
-            f"LONG | ${price:.2f} | Score {sig['long_score']} | "
-            f"RSI {sig['rsi']} | Vol {sig['vol_ratio']}x | "
-            f"Size {round(size*100)}% | Regime {regime}",
-            "trade")
-        log.info(f"LONG {symbol} at {price} | score={sig['long_score']} | regime={regime}")
- 
-def try_short(symbol, sig, regime, now):
-    """Try to open a short position"""
-    if not sig or sig.get("short_score", 0) < STRATEGY["min_score_short"]:
-        return
-    if not sig.get("atr_ok", True):
-        return
-    if symbol in bot_state["positions"] and bot_state["positions"][symbol]["side"] == "short":
-        return  # Already short this symbol
-    if len([p for p in bot_state["positions"].values() if p["side"] == "short"]) >= STRATEGY["max_short_positions"]:
-        return  # Max 1 short at a time
-    if bot_state["killed"]:
-        return
-    if not can_open_short():
-        return  # After 2PM ET — no new shorts
-    if is_short_locked_out(symbol):
-        return  # 24hr lockout
-    if bot_state["day_trades_used"] >= STRATEGY["max_day_trades_per_week"]:
-        log.info(f"PDT limit reached — {bot_state['day_trades_used']}/3 day trades used this week")
-        return
- 
-    # VIX check
-    if bot_state["vix"] > STRATEGY["vix_max"]:
-        return
- 
-    # Position sizing based on regime
-    size = STRATEGY["position_size_with_trend"] if regime == "BEAR" else STRATEGY["position_size_against_trend"]
- 
-    # Reduce size if VIX elevated
-    if bot_state["vix"] > STRATEGY["vix_reduce_threshold"]:
-        size = size * 0.5
- 
-    cash   = bot_state["account_cash"]
-    budget = cash * size
-    price  = sig["price"]
-    qty    = budget / price
- 
-    if budget < 100 or qty < 0.01:
-        return
- 
-    order = place_order(symbol, qty, "SELL")
-    if order:
-        bot_state["positions"][symbol] = {
-            "symbol": symbol, "entry": price, "qty": qty,
-            "side": "short", "current_price": price, "unrealized_pnl": 0,
-            "open_time": now.isoformat(),
-            "open_date": get_et_time().date().isoformat()
-        }
-        sync_positions()
-        add_diary(symbol,
-            f"SHORT | ${price:.2f} | Score {sig['short_score']} | "
-            f"RSI {sig['rsi']} | Vol {sig['vol_ratio']}x | "
+            f"{'BUY' if side=='long' else 'SHORT'} | "
+            f"${price:.2f} | Score {score} | "
             f"Size {round(size*100)}% | Regime {regime} | "
-            f"DayTrades {bot_state['day_trades_used']+1}/3",
-            "trade")
-        log.info(f"SHORT {symbol} at {price} | score={sig['short_score']} | regime={regime}")
- 
-# ── Trading loop ───────────────────────────────────────────────────────────────
+            f"VIX {bot_state['vix']:.1f}",
+            "trade", strategy)
+        log.info(f"[{strategy}] {side.upper()} {symbol} at {price} | score={score} | size={round(size*100)}%")
+
+# ── TRADING LOOP ───────────────────────────────────────────────────────────────
 def trading_loop():
     if not API_KEY or not API_SECRET:
         log.warning("No Alpaca credentials — cannot start")
         return
- 
+
     add_diary("SYSTEM",
-        "ETF Bot v1.2 started | SPY + QQQ + GLD + SQQQ | Long + Short | "
-        "TP=1.5% SL=0.75% | 1H candle lockout | No PDT limit | "
-        "Bear threshold=3 | Force close 3:55PM ET",
-        "system")
-    log.info("ETF Bot v1.2 started")
- 
+        "ETF Bot v2.0 started | SPY+QQQ+GLD+SQQQ | "
+        "5 Strategies: EMA+MSS+VPA+Breakout+Gap | "
+        "TP=1.5% SL=0.75% | 1H lockout | No PDT | "
+        "Bear threshold=3 | Force close 3:55PM ET", "system")
+    log.info("ETF Bot v2.0 started")
+
     regime_check_time = None
     vix_check_time    = None
     daily_reset_date  = None
- 
+
     while True:
         try:
             now    = datetime.now(timezone.utc)
             et_now = get_et_time()
- 
+            today  = et_now.date()
+
             # Daily reset
-            today = et_now.date()
             if daily_reset_date != today:
                 bot_state["day_pnl"] = 0.0
                 bot_state["daily_start_equity"] = 0.0
                 bot_state["daily_paused"] = False
-                bot_state["same_day_shorts"] = {}
+                bot_state["gap_fired_today"] = {}
                 daily_reset_date = today
                 log.info(f"Daily reset — {today}")
- 
-            # PDT weekly reset
-            check_and_reset_day_trades()
- 
+
             if not is_market_open():
                 bot_state["market_open"] = False
                 bot_state["in_trading_window"] = False
                 time.sleep(60)
                 continue
- 
+
             bot_state["market_open"] = True
             bot_state["in_trading_window"] = is_trading_window()
- 
+
             refresh_account()
             sync_positions()
- 
-            # Force close check at 3:55PM ET
-            force_close = should_force_close()
-            if force_close:
-                for symbol in list(bot_state["positions"].keys()):
-                    pos = bot_state["positions"].get(symbol, {})
-                    if pos.get("side") == "short" and is_same_day_short(symbol):
-                        bars = get_bars(symbol, "1Min", 3)
-                        price = bars[-1]["close"] if bars else pos["entry"]
-                        check_exits(symbol, price, now, et_now, force_close=True)
+
+            # Check daily loss limit
+            start_eq = bot_state["daily_start_equity"]
+            if start_eq > 0:
+                loss_pct = (start_eq - bot_state["account_equity"]) / start_eq * 100
+                if loss_pct >= 5.0 and not bot_state["daily_paused"]:
+                    bot_state["daily_paused"] = True
+                    add_diary("SYSTEM", f"Daily loss limit 5% hit — paused", "system")
+
+            # Force close at 3:55PM ET
+            if should_force_close():
+                for sym in list(bot_state["positions"].keys()):
+                    check_exits(sym, now, force_close=True)
                 time.sleep(60)
                 continue
- 
+
             # Regime check every 30 minutes
             if not regime_check_time or (now - regime_check_time).total_seconds() > 1800:
                 bot_state["market_regime"] = check_market_regime()
                 regime_check_time = now
- 
+
             # VIX check every 15 minutes
             if not vix_check_time or (now - vix_check_time).total_seconds() > 900:
                 vix = get_vix()
                 bot_state["vix"] = round(vix, 2)
-                if vix > STRATEGY["vix_max"]:
-                    bot_state["vix_status"] = "DANGER"
-                elif vix > STRATEGY["vix_reduce_threshold"]:
-                    bot_state["vix_status"] = "ELEVATED"
-                else:
-                    bot_state["vix_status"] = "CALM"
+                bot_state["vix_status"] = "DANGER" if vix > RISK["vix_max"] else "ELEVATED" if vix > RISK["vix_reduce_threshold"] else "CALM"
                 log.info(f"VIX: {vix:.2f} — {bot_state['vix_status']}")
                 vix_check_time = now
- 
+
+            if bot_state["daily_paused"] or bot_state["killed"]:
+                time.sleep(60)
+                continue
+
             regime = bot_state["market_regime"]
- 
+
             for symbol in SYMBOLS:
-                if bot_state["killed"]:
-                    break
- 
-                # Get signal
-                sig = generate_signal(symbol)
-                if not sig:
-                    continue
- 
-                price = sig["price"]
- 
-                # Check exits
-                check_exits(symbol, price, now, et_now)
- 
-                # Try entries if in trading window
-                if is_trading_window():
-                    # Long entry
-                    if symbol not in bot_state["positions"] or \
-                       bot_state["positions"][symbol]["side"] != "long":
-                        try_long(symbol, sig, regime, now)
- 
-                    # Short entry
-                    if symbol not in bot_state["positions"] or \
-                       bot_state["positions"][symbol]["side"] != "short":
-                        try_short(symbol, sig, regime, now)
- 
+                if bot_state["killed"]: break
+
+                # Exit checks first
+                check_exits(symbol, now)
+
+                if not is_trading_window(): continue
+
+                # Run all 5 strategies in priority order
+                # Gap (highest priority — time sensitive, only fires at open)
+                if bot_state["strategy_positions"]["Gap"] is None:
+                    sig = run_gap_detector(symbol, regime)
+                    if sig:
+                        if sig.get("long_score", 0) >= RISK["min_score_long"]:
+                            try_entry(symbol, "Gap", sig, regime, "long", now)
+                        elif sig.get("short_score", 0) >= RISK["min_score_short_bear"] and symbol in SHORT_ELIG:
+                            try_entry(symbol, "Gap", sig, regime, "short", now)
+
+                # Breakout
+                if bot_state["strategy_positions"]["Breakout"] is None:
+                    sig = run_breakout(symbol, regime)
+                    if sig:
+                        if sig.get("long_score", 0) >= RISK["min_score_long"]:
+                            try_entry(symbol, "Breakout", sig, regime, "long", now)
+                        if sig.get("short_score", 0) >= (RISK["min_score_short_bear"] if regime=="BEAR" else RISK["min_score_short_bull"]) and symbol in SHORT_ELIG:
+                            try_entry(symbol, "Breakout", sig, regime, "short", now)
+
+                # VPA
+                if bot_state["strategy_positions"]["VPA"] is None:
+                    sig = run_vpa(symbol, regime)
+                    if sig:
+                        if sig.get("long_score", 0) >= VPA_CONFIG["min_score"]:
+                            try_entry(symbol, "VPA", sig, regime, "long", now)
+                        if sig.get("short_score", 0) >= VPA_CONFIG["min_score"] and symbol in SHORT_ELIG:
+                            try_entry(symbol, "VPA", sig, regime, "short", now)
+
+                # MSS
+                if bot_state["strategy_positions"]["MSS"] is None:
+                    sig = run_mss(symbol, regime)
+                    if sig:
+                        if sig.get("long_score", 0) >= RISK["min_score_long"]:
+                            try_entry(symbol, "MSS", sig, regime, "long", now)
+                        if sig.get("short_score", 0) >= (RISK["min_score_short_bear"] if regime=="BEAR" else RISK["min_score_short_bull"]) and symbol in SHORT_ELIG:
+                            try_entry(symbol, "MSS", sig, regime, "short", now)
+
+                # EMA
+                if bot_state["strategy_positions"]["EMA"] is None:
+                    sig = run_ema(symbol, regime)
+                    if sig:
+                        if sig.get("long_score", 0) >= RISK["min_score_long"]:
+                            try_entry(symbol, "EMA", sig, regime, "long", now)
+                        if sig.get("short_score", 0) >= (RISK["min_score_short_bear"] if regime=="BEAR" else RISK["min_score_short_bull"]) and symbol in SHORT_ELIG:
+                            try_entry(symbol, "EMA", sig, regime, "short", now)
+
+                # Update signals dict
+                for strat_name, run_fn in [("EMA",run_ema),("MSS",run_mss),("VPA",run_vpa),("Breakout",run_breakout)]:
+                    pass  # Signals already updated in each run function
+
         except Exception as e:
             log.error(f"Loop error: {e}")
             import traceback
             log.error(traceback.format_exc())
- 
+
         time.sleep(60)
- 
+
 threading.Thread(target=trading_loop, daemon=True).start()
- 
+
 # ── Flask routes ───────────────────────────────────────────────────────────────
 @app.after_request
 def no_cache(r):
     r.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     r.headers["Pragma"] = "no-cache"
     return r
- 
+
 def clean_nan(obj):
     if isinstance(obj, float):
         return 0.0 if (math.isnan(obj) or math.isinf(obj)) else obj
-    if isinstance(obj, dict):
-        return {k: clean_nan(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [clean_nan(i) for i in obj]
-    try:
-        import numpy as np
-        if isinstance(obj, (np.floating, np.integer)):
-            return float(obj)
-        if isinstance(obj, np.bool_):
-            return bool(obj)
-    except ImportError:
-        pass
+    if isinstance(obj, dict): return {k: clean_nan(v) for k, v in obj.items()}
+    if isinstance(obj, list): return [clean_nan(i) for i in obj]
     return obj
- 
+
 @app.route("/health")
 def health():
     et = get_et_time()
     return jsonify({
-        "status": "ok",
+        "status": "ok", "version": bot_state["version"],
         "time": datetime.now(timezone.utc).isoformat(),
         "et_time": et.strftime("%H:%M ET"),
-        "version": bot_state["version"],
         "market_open": bot_state["market_open"],
         "in_trading_window": bot_state["in_trading_window"],
-        "vix": bot_state["vix"],
-        "vix_status": bot_state["vix_status"],
         "regime": bot_state["market_regime"],
-        "short_lockouts": {k: v for k,v in bot_state["short_lockouts"].items()}
+        "vix": bot_state["vix"], "vix_status": bot_state["vix_status"],
+        "positions": len(bot_state["positions"]),
+        "daily_paused": bot_state["daily_paused"]
     })
- 
+
 @app.route("/status")
 def status():
     refresh_account()
-    wins  = bot_state["win_count"]
-    total = bot_state["total_trades"]
-    et    = get_et_time()
+    wins = bot_state["win_count"]; total = bot_state["total_trades"]
+    et = get_et_time()
     return jsonify(clean_nan({
-        "running": bot_state["running"],
-        "killed": bot_state["killed"],
-        "paper_mode": PAPER_MODE,
+        "running": bot_state["running"], "killed": bot_state["killed"],
+        "paper_mode": PAPER_MODE, "version": bot_state["version"],
         "market_open": bot_state["market_open"],
         "in_trading_window": bot_state["in_trading_window"],
         "et_time": et.strftime("%H:%M ET"),
         "positions": bot_state["positions"],
+        "strategy_positions": bot_state["strategy_positions"],
         "closed_trades": bot_state["closed_trades"][-50:],
         "diary": bot_state["diary"][-100:],
         "day_pnl": bot_state["day_pnl"],
         "total_trades": total,
         "win_rate": round(wins/total*100) if total > 0 else 0,
+        "strategy_stats": bot_state["strategy_stats"],
         "long_stats": bot_state["long_stats"],
         "short_stats": bot_state["short_stats"],
         "signals": bot_state["signals"],
-        "strategy": STRATEGY,
         "account_cash": bot_state["account_cash"],
         "account_equity": bot_state["account_equity"],
         "account_buying_power": bot_state["account_buying_power"],
         "market_regime": bot_state["market_regime"],
-        "vix": bot_state["vix"],
-        "vix_status": bot_state["vix_status"],
+        "vix": bot_state["vix"], "vix_status": bot_state["vix_status"],
         "short_lockouts": bot_state["short_lockouts"],
-        "version": bot_state["version"]
+        "prev_closes": bot_state["prev_closes"],
+        "gap_fired_today": bot_state["gap_fired_today"],
+        "daily_paused": bot_state["daily_paused"],
+        "strategy": RISK
     }))
- 
+
 @app.route("/diary")
 def diary():
-    return jsonify({"diary": bot_state["diary"]})
- 
+    strategy_filter = request.args.get("strategy")
+    entries = bot_state["diary"]
+    if strategy_filter:
+        entries = [e for e in entries if e.get("strategy") == strategy_filter]
+    return jsonify({"diary": entries})
+
 @app.route("/kill", methods=["POST"])
 def kill():
     bot_state["killed"] = not bot_state["killed"]
     status = "KILLED" if bot_state["killed"] else "RESUMED"
     add_diary("SYSTEM", f"Kill switch {status}", "system")
     return jsonify({"killed": bot_state["killed"]})
- 
+
 @app.route("/bars")
 def bars():
     symbol = request.args.get("symbol", "SPY")
@@ -833,34 +1156,49 @@ def bars():
         try:
             from datetime import datetime as dt
             t = b["time"]
-            if isinstance(t, str):
-                ts = int(dt.fromisoformat(t.replace("Z","+00:00")).timestamp())
-            else:
-                ts = int(t)
+            ts = int(dt.fromisoformat(t.replace("Z","+00:00")).timestamp()) if isinstance(t,str) else int(t)
             result.append({"time": ts, "open": b["open"], "high": b["high"],
                            "low": b["low"], "close": b["close"]})
-        except:
-            pass
+        except: pass
     return jsonify(result)
- 
+
 @app.route("/history")
 def history():
-    return jsonify({"trades": bot_state["closed_trades"]})
- 
+    strategy_filter = request.args.get("strategy")
+    trades = bot_state["closed_trades"]
+    if strategy_filter:
+        trades = [t for t in trades if t.get("strategy") == strategy_filter]
+    return jsonify({"trades": trades})
+
+@app.route("/stats")
+def stats():
+    return jsonify(clean_nan({
+        "overall": {
+            "total_trades": bot_state["total_trades"],
+            "win_rate": round(bot_state["win_count"]/bot_state["total_trades"]*100)
+                        if bot_state["total_trades"] > 0 else 0,
+            "day_pnl": bot_state["day_pnl"]
+        },
+        "by_strategy": {
+            s: {
+                "trades": bot_state["strategy_stats"][s]["trades"],
+                "wins": bot_state["strategy_stats"][s]["wins"],
+                "win_rate": round(bot_state["strategy_stats"][s]["wins"] /
+                            bot_state["strategy_stats"][s]["trades"] * 100)
+                            if bot_state["strategy_stats"][s]["trades"] > 0 else 0,
+                "pnl": bot_state["strategy_stats"][s]["pnl"]
+            } for s in STRATEGIES
+        }
+    }))
+
 @app.route("/")
 def index():
     try:
-        with open("index.html") as f:
-            return f.read()
+        with open("index.html") as f: return f.read()
     except:
-        return jsonify({
-            "status": "ETF Bot v1.0 running",
-            "symbols": SYMBOLS,
-            "regime": bot_state["market_regime"],
-            "vix": bot_state["vix"],
-            "day_trades_used": bot_state["day_trades_used"]
-        })
- 
+        return jsonify({"status": "ETF Bot v2.0 running",
+                        "strategies": STRATEGIES, "symbols": SYMBOLS})
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
