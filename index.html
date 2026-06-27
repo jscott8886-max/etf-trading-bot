@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ETF Trader — SPY & QQQ</title>
+<title>AlphaTrader — ETF v2.1</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/lightweight-charts/3.8.0/lightweight-charts.standalone.production.js"></script>
 <style>
   :root {
@@ -93,6 +93,9 @@
   .nav-tab.tab-spy   .dot { background: #3b82f6; }
   .nav-tab.tab-qqq   .dot { background: #8b5cf6; }
   .nav-tab.tab-diary .dot { background: var(--text-dim); }
+  .nav-tab.tab-gap   .dot { background: #06b6d4; }
+  .nav-tab.tab-gld   .dot { background: #eab308; }
+  .nav-tab.tab-sqqq  .dot { background: #ef4444; }
   .nav-tab.active .dot { background: var(--bg); }
   .pos-indicator { width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
   .short-indicator { width: 6px; height: 6px; border-radius: 50%; background: var(--crimson); animation: pulse 2s infinite; }
@@ -135,6 +138,8 @@
   .sym-badge { padding: 3px 10px; border-radius: 3px; font-size: 11px; font-weight: 900; }
   .sym-spy { background: rgba(59,130,246,0.15); color: #60a5fa; border: 1px solid rgba(59,130,246,0.3); }
   .sym-qqq { background: rgba(139,92,246,0.15); color: #a78bfa; border: 1px solid rgba(139,92,246,0.3); }
+  .sym-gld { background: rgba(234,179,8,0.15); color: #eab308; border: 1px solid rgba(234,179,8,0.3); }
+  .sym-sqqq { background: rgba(239,68,68,0.15); color: #ef4444; border: 1px solid rgba(239,68,68,0.3); }
 
   .pnl-pos { color: var(--green); font-weight: 700; }
   .pnl-neg { color: var(--red); font-weight: 700; }
@@ -240,7 +245,7 @@
     <div class="logo-mark">ETF</div>
     <div>
       <div class="logo-text">ALPHATRADER</div>
-      <div class="logo-sub">SPY · QQQ · LONG + SHORT</div>
+      <div class="logo-sub">SPY · QQQ · GLD · SQQQ · v2.1</div>
     </div>
   </div>
   <div class="header-right">
@@ -276,6 +281,9 @@
   <div class="nav-tab tab-home active" onclick="showTab('home')"><div class="dot"></div>Home</div>
   <div class="nav-tab tab-spy"   onclick="showTab('spy')"><div class="dot"></div>SPY <span id="spy-dot"></span></div>
   <div class="nav-tab tab-qqq"   onclick="showTab('qqq')"><div class="dot"></div>QQQ <span id="qqq-dot"></span></div>
+  <div class="nav-tab tab-gld"   onclick="showTab('gld')"><div class="dot" style="background:#eab308"></div>GLD <span id="gld-dot"></span></div>
+  <div class="nav-tab tab-sqqq"  onclick="showTab('sqqq')"><div class="dot" style="background:#ef4444"></div>SQQQ <span id="sqqq-dot"></span></div>
+  <div class="nav-tab tab-gap"   onclick="showTab('gap')"><div class="dot" style="background:#06b6d4"></div>Gap</div>
   <div class="nav-tab tab-diary" onclick="showTab('diary')"><div class="dot"></div>Diary</div>
 </div>
 
@@ -283,9 +291,9 @@
 <div class="main" id="mainContent"></div>
 
 <script>
-const RAILWAY_URL = 'REPLACE_WITH_YOUR_URL';
-const SYMBOLS = ['SPY','QQQ'];
-const SYM_COLORS = { SPY: '#3b82f6', QQQ: '#8b5cf6' };
+const RAILWAY_URL = 'https://etf-trading-bot-production.up.railway.app';
+const SYMBOLS = ['SPY','QQQ','GLD','SQQQ'];
+const SYM_COLORS = { SPY: '#3b82f6', QQQ: '#8b5cf6', GLD: '#eab308', SQQQ: '#ef4444' };
 
 let LIVE = {};
 let currentTab = 'home';
@@ -405,6 +413,110 @@ function updateNavDots() {
   }
 }
 
+function renderGapTab() {
+  const sigs = LIVE.signals || {};
+  const prevCloses = LIVE.prev_closes || {};
+  const gapFired = LIVE.gap_fired_today || {};
+  const regime = LIVE.market_regime || 'UNKNOWN';
+  const et = LIVE.et_time || '—';
+
+  // Check if within gap window
+  let inGapWindow = false;
+  if (LIVE.market_open) {
+    const parts = (LIVE.et_time || '').split(':');
+    if (parts.length >= 1) {
+      const h = parseInt(parts[0]);
+      const m = parseInt(parts[1]) || 0;
+      const mins = h * 60 + m;
+      inGapWindow = mins >= 570 && mins < 600; // 9:30-10:00 AM
+    }
+  }
+
+  let gapCards = '';
+  for (const sym of ['SPY', 'QQQ', 'GLD', 'SQQQ']) {
+    const prevClose = prevCloses[sym];
+    const sig = sigs[sym] || {};
+    const fired = gapFired[sym];
+    const color = SYM_COLORS[sym];
+
+    // Try to get current price from signals
+    let currPrice = sig.price || 0;
+
+    let gapPct = 0;
+    if (prevClose && currPrice) {
+      gapPct = ((currPrice - prevClose) / prevClose * 100);
+    }
+
+    const gapDir = gapPct > 0 ? 'UP' : gapPct < 0 ? 'DOWN' : 'FLAT';
+    const gapColor = gapPct > 0.5 ? 'var(--green)' : gapPct < -0.5 ? 'var(--crimson)' : 'var(--silver-dim)';
+    const qualifies = Math.abs(gapPct) >= 0.5 && Math.abs(gapPct) <= 3.0;
+
+    gapCards += \`<div class="stat-card" style="border-left:3px solid \${color}">
+      <div class="stat-label" style="color:\${color}">\${sym}</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px">
+        <div>
+          <div style="font-size:11px;color:var(--text-dim)">Prev Close</div>
+          <div style="font-size:16px;font-weight:700;color:var(--silver)">\${prevClose ? '$'+prevClose.toFixed(2) : '—'}</div>
+        </div>
+        <div style="text-align:center">
+          <div style="font-size:11px;color:var(--text-dim)">Gap</div>
+          <div style="font-size:22px;font-weight:900;color:\${gapColor}">
+            \${gapPct !== 0 ? (gapPct > 0 ? '▲' : '▼') : '—'} \${Math.abs(gapPct).toFixed(2)}%
+          </div>
+        </div>
+        <div style="text-align:right">
+          <div style="font-size:11px;color:var(--text-dim)">Current</div>
+          <div style="font-size:16px;font-weight:700;color:var(--silver)">\${currPrice ? '$'+currPrice.toFixed(2) : '—'}</div>
+        </div>
+      </div>
+      <div style="margin-top:10px;display:flex;justify-content:space-between;font-size:11px">
+        <span style="color:var(--text-dim)">Qualifies: <span style="color:\${qualifies?'var(--green)':'var(--crimson)'}">\${qualifies ? '✓ Yes (0.5-3%)' : '✗ No'}</span></span>
+        <span style="color:var(--text-dim)">Fired: <span style="color:\${fired?'var(--green)':'var(--text-dim)'}">\${fired ? '✓ Entered' : '✗ Not yet'}</span></span>
+      </div>
+    </div>\`;
+  }
+
+  document.getElementById('mainContent').innerHTML = \`
+    <div class="card" style="margin-bottom:14px;border-left:3px solid #06b6d4">
+      <div class="card-title" style="color:#06b6d4">Gap Detector Strategy</div>
+      <div style="font-size:12px;color:var(--text-dim);line-height:1.7">
+        Fires within the <span style="color:var(--silver);font-weight:700">first 30 minutes</span> of market open (9:30-10:00 AM ET).
+        Compares today's open to yesterday's close. Gap up ≥0.5% on volume → <span style="color:var(--green)">LONG</span>.
+        Gap down ≥0.5% on volume → <span style="color:var(--crimson)">SHORT</span>.
+        Extreme gaps &gt;3% are skipped (too risky).
+      </div>
+      <div style="margin-top:10px;display:flex;gap:12px;font-size:11px">
+        <span style="color:var(--text-dim)">Status:
+          <span style="font-weight:700;color:\${inGapWindow ? '#06b6d4' : 'var(--text-dim)'}">
+            \${inGapWindow ? '⚡ ACTIVE — Gap window open' : LIVE.market_open ? '⏰ Window closed for today' : '🔒 Market closed'}
+          </span>
+        </span>
+        <span style="color:var(--text-dim)">Time: <span style="color:var(--silver)">\${et}</span></span>
+        <span style="color:var(--text-dim)">Regime: <span style="color:\${regime==='BULL'?'var(--green)':regime==='BEAR'?'var(--crimson)':'var(--text-dim)'}">\${regime}</span></span>
+      </div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:14px">
+      \${gapCards}
+    </div>
+
+    <div class="card">
+      <div class="card-title">Gap Trade History</div>
+      \${renderGapDiary()}
+    </div>\`;
+}
+
+function renderGapDiary() {
+  const entries = (LIVE.diary || []).filter(e => e.strategy === 'Gap' || (e.text && e.text.includes('[Gap]')));
+  if (!entries.length) return '<div class="empty-state"><div class="icon">📊</div>No gap trades yet — fires at market open</div>';
+  return entries.map(e => \`
+    <div class="diary-entry">
+      <span class="diary-time">\${e.time}</span>
+      <span class="diary-symbol diary-type-\${e.type}">\${e.symbol}</span>
+      <span class="diary-text">\${e.text}</span>
+    </div>\`).join('');
+}
+
 function showTab(tab) {
   currentTab = tab;
   document.querySelectorAll('.nav-tab').forEach(el => el.classList.remove('active'));
@@ -416,6 +528,9 @@ function renderCurrentTab() {
   if (currentTab === 'home') renderHome();
   else if (currentTab === 'spy') renderSymbol('SPY');
   else if (currentTab === 'qqq') renderSymbol('QQQ');
+  else if (currentTab === 'gld') renderSymbol('GLD');
+  else if (currentTab === 'sqqq') renderSymbol('SQQQ');
+  else if (currentTab === 'gap') renderGapTab();
   else if (currentTab === 'diary') renderDiary();
 }
 
@@ -499,6 +614,22 @@ function renderHome() {
         <div class="stat-value ${pdtLeft===0?'red':'gold'}">${pdtLeft}/3</div>
         <div class="stat-sub">${pdtUsed} used this week</div>
       </div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:14px">
+      ${(() => {
+        const ss = LIVE.strategy_stats || {};
+        const stratColors = { EMA: '#3b82f6', MSS: '#8b5cf6', VPA: '#22c55e', Breakout: '#f97316', Gap: '#06b6d4' };
+        return Object.entries(stratColors).map(([name, color]) => {
+          const s = ss[name] || {trades:0,wins:0,pnl:0};
+          const wr = s.trades > 0 ? Math.round(s.wins/s.trades*100) : 0;
+          return \`<div class="stat-card" style="padding:10px 12px">
+            <div class="stat-label" style="color:\${color}">\${name}</div>
+            <div style="font-size:18px;font-weight:900;color:var(--silver)">\${s.trades}</div>
+            <div style="font-size:10px;color:var(--text-dim)">\${wr}% · \${s.pnl>=0?'+':''}$\${fmt(s.pnl)}</div>
+          </div>\`;
+        }).join('');
+      })()}
     </div>
 
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px">
@@ -638,7 +769,7 @@ function renderPosDetail(pos, symbol) {
 function renderSignalBoxes(sig) {
   const ls = sig.long_score || 0;
   const ss = sig.short_score || 0;
-  const maxS = 8;
+  const maxS = 9;
   return `<div class="signal-boxes">
     <div class="signal-box long-box">
       <div class="signal-box-label">Long Score</div>
@@ -819,7 +950,7 @@ function renderDiary() {
     : diaryFilter === 'LONG' ? entries.filter(e => e.text?.includes('LONG') || e.text?.includes('[long]'))
     : diaryFilter === 'SHORT' ? entries.filter(e => e.text?.includes('SHORT') || e.text?.includes('[short]'))
     : entries.filter(e => e.type === diaryFilter.toLowerCase());
-  const filters = ['ALL','LONG','SHORT','win','loss'];
+  const filters = ['ALL','LONG','SHORT','Gap','win','loss'];
 
   document.getElementById('mainContent').innerHTML = `
     <div class="card">
