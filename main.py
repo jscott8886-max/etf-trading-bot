@@ -118,7 +118,7 @@ bot_state = {
     "prev_closes": {},       # Previous day closes for gap detection
     "gap_fired_today": {},   # Track gap signals already fired today
     "mss_last_signal_time": {s: None for s in SYMBOLS},
-    "version": "ETF-2.0"
+    "version": "ETF-2.1"
 }
 
 # ── Alpaca helpers ─────────────────────────────────────────────────────────────
@@ -355,17 +355,47 @@ def calc_atr(bars, period=14):
 
 # ── Market regime & VIX ────────────────────────────────────────────────────────
 def check_market_regime():
+    """SPY regime check with 200 EMA primary, 50 EMA fallback"""
     try:
         bars = get_bars("SPY", "1Day", 210)
-        if len(bars) < 200: return "UNKNOWN"
+        if not bars:
+            log.warning("Regime check: no daily bars returned")
+            return "UNKNOWN"
+
         closes = [b["close"] for b in bars]
-        ema200 = calc_ema(closes, 200)
-        if not ema200: return "UNKNOWN"
-        regime = "BULL" if closes[-1] > ema200[-1] else "BEAR"
-        log.info(f"Regime: {regime} | SPY={closes[-1]:.2f} | 200EMA={ema200[-1]:.2f}")
-        return regime
+        log.info(f"Regime check: got {len(closes)} daily bars for SPY")
+
+        # Primary: 200 EMA
+        if len(closes) >= 200:
+            ema200 = calc_ema(closes, 200)
+            if ema200:
+                regime = "BULL" if closes[-1] > ema200[-1] else "BEAR"
+                log.info(f"Regime: {regime} | SPY={closes[-1]:.2f} | 200EMA={ema200[-1]:.2f}")
+                return regime
+
+        # Fallback: 50 EMA if not enough bars for 200
+        if len(closes) >= 50:
+            ema50 = calc_ema(closes, 50)
+            if ema50:
+                regime = "BULL" if closes[-1] > ema50[-1] else "BEAR"
+                log.info(f"Regime (50EMA fallback): {regime} | SPY={closes[-1]:.2f} | 50EMA={ema50[-1]:.2f}")
+                return regime
+
+        # Last resort: 20 EMA
+        if len(closes) >= 20:
+            ema20 = calc_ema(closes, 20)
+            if ema20:
+                regime = "BULL" if closes[-1] > ema20[-1] else "BEAR"
+                log.info(f"Regime (20EMA fallback): {regime} | SPY={closes[-1]:.2f} | 20EMA={ema20[-1]:.2f}")
+                return regime
+
+        log.warning(f"Regime check: only {len(closes)} bars — cannot determine regime")
+        return "UNKNOWN"
     except Exception as e:
-        log.error(f"Regime error: {e}"); return "UNKNOWN"
+        log.error(f"Regime error: {e}")
+        import traceback
+        log.error(traceback.format_exc())
+        return "UNKNOWN"
 
 def get_vix():
     try:
@@ -930,11 +960,11 @@ def trading_loop():
         return
 
     add_diary("SYSTEM",
-        "ETF Bot v2.0 started | SPY+QQQ+GLD+SQQQ | "
+        "ETF Bot v2.1 started | SPY+QQQ+GLD+SQQQ | "
         "5 Strategies: EMA+MSS+VPA+Breakout+Gap | "
         "TP=1.5% SL=0.75% | 1H lockout | No PDT | "
         "Bear threshold=3 | Force close 3:55PM ET", "system")
-    log.info("ETF Bot v2.0 started")
+    log.info("ETF Bot v2.1 started")
 
     regime_check_time = None
     vix_check_time    = None
@@ -966,6 +996,18 @@ def trading_loop():
 
             refresh_account()
             sync_positions()
+
+            # Force regime + VIX check on first loop after market opens
+            if bot_state["market_regime"] == "UNKNOWN" or not regime_check_time:
+                log.info("Forcing immediate regime check — first scan of the day")
+                bot_state["market_regime"] = check_market_regime()
+                regime_check_time = datetime.now(timezone.utc)
+                # Also force VIX immediately
+                vix = get_vix()
+                bot_state["vix"] = round(vix, 2)
+                bot_state["vix_status"] = "DANGER" if vix > RISK["vix_max"] else "ELEVATED" if vix > RISK["vix_reduce_threshold"] else "CALM"
+                log.info(f"VIX (startup): {vix:.2f} — {bot_state['vix_status']}")
+                vix_check_time = datetime.now(timezone.utc)
 
             # Check daily loss limit
             start_eq = bot_state["daily_start_equity"]
