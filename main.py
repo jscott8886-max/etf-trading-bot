@@ -18,9 +18,9 @@ API_KEY    = os.environ.get("ALPACA_API_KEY", "")
 API_SECRET = os.environ.get("ALPACA_API_SECRET", "")
 PAPER_MODE = os.environ.get("PAPER_MODE", "true").lower() == "true"
 
-SYMBOLS    = ["SPY", "QQQ", "GLD", "SQQQ"]
+SYMBOLS    = ["SPY", "QQQ", "GLD", "SQQQ", "IWM", "DIA", "XLF", "XLK", "TLT"]
 LONG_ONLY  = ["GLD", "SQQQ"]
-SHORT_ELIG = ["SPY", "QQQ"]
+SHORT_ELIG = ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "TLT"]
 STRATEGIES = ["EMA", "MSS", "VPA", "Breakout", "Gap"]
 
 # ── Strategy configs ───────────────────────────────────────────────────────────
@@ -29,7 +29,7 @@ EMA_CONFIG = {
     "rsi_hard_gate": 55,
     "rsi_entry_max": 40,
     "bb_min_bw": 0.3,
-    "min_score": 4,
+    "min_score": 4, "min_score_confirmed": 3,
     "atr_min_mult": 0.7,
     "volume_bonus_mult": 1.5,
     "time_filter": True,
@@ -80,8 +80,8 @@ RISK = {
     "stop_loss_pct": 0.75,
     "position_size_with_trend": 0.25,
     "position_size_against_trend": 0.125,
-    "max_long_positions": 4,
-    "max_short_positions": 2,
+    "max_long_positions": 6,
+    "max_short_positions": 3,
     "short_lockout_minutes": 60,
     "last_short_entry_hour_et": 14,
     "force_close_hour_et": 15,
@@ -93,20 +93,20 @@ RISK = {
     "min_score_short_bear": 3,
     "long_only": LONG_ONLY,
     "short_eligible": SHORT_ELIG,
-    "cooldown_minutes": 20,
+    "cooldown_minutes": 10,
 }
 
 bot_state = {
     "running": True, "killed": False,
     "positions": {},
-    "strategy_positions": {s: None for s in STRATEGIES},
+    "strategy_positions": {s: [] for s in STRATEGIES},
     "closed_trades": [], "diary": [],
     "day_pnl": 0.0, "daily_start_equity": 0.0,
     "total_trades": 0, "win_count": 0,
     "strategy_stats": {s: {"trades": 0, "wins": 0, "pnl": 0.0} for s in STRATEGIES},
     "long_stats":  {"trades": 0, "wins": 0, "pnl": 0.0},
     "short_stats": {"trades": 0, "wins": 0, "pnl": 0.0},
-    "signals": {s: {} for s in SYMBOLS},
+    "signals": {s: {} for s in ["SPY","QQQ","GLD","SQQQ","IWM","DIA","XLF","XLK","TLT"]},
     "account_cash": 0.0, "account_equity": 0.0, "account_buying_power": 0.0,
     "market_regime": "UNKNOWN",
     "vix": 0.0, "vix_status": "UNKNOWN",
@@ -117,8 +117,9 @@ bot_state = {
     "daily_paused": False,
     "prev_closes": {},       # Previous day closes for gap detection
     "gap_fired_today": {},   # Track gap signals already fired today
-    "mss_last_signal_time": {s: None for s in SYMBOLS},
-    "version": "ETF-2.1"
+    "mss_last_signal_time": {s: None for s in ["SPY","QQQ","GLD","SQQQ","IWM","DIA","XLF","XLK","TLT"]},
+    "pending_confirmation": {},
+    "version": "ETF-3.0"
 }
 
 # ── Alpaca helpers ─────────────────────────────────────────────────────────────
@@ -209,9 +210,9 @@ def sync_positions():
             }
         # Clear strategy slots for closed positions
         for strat in STRATEGIES:
-            held = bot_state["strategy_positions"].get(strat)
-            if held and held not in active_symbols:
-                bot_state["strategy_positions"][strat] = None
+            bot_state["strategy_positions"][strat] = [
+                s for s in bot_state["strategy_positions"].get(strat, []) if s in active_symbols
+            ]
         bot_state["positions"] = synced
     except Exception as e:
         log.error(f"Sync positions error: {e}")
@@ -429,9 +430,10 @@ def can_enter(symbol, strategy, side):
     if bot_state["daily_paused"]: return False, "Daily loss limit"
     if bot_state["vix"] > RISK["vix_max"]: return False, f"VIX too high {bot_state['vix']}"
 
-    # Strategy slot check
-    if bot_state["strategy_positions"].get(strategy):
-        return False, f"{strategy} already has position"
+    # Strategy slot check — allow 2 per strategy
+    strat_positions = bot_state["strategy_positions"].get(strategy, [])
+    if len(strat_positions) >= 2:
+        return False, f"{strategy} at max positions"
 
     # Symbol already held
     if symbol in bot_state["positions"]:
@@ -876,9 +878,10 @@ def check_exits(symbol, now, force_close=False):
             if win: s["wins"] += 1
 
             # Clear strategy slot
-            for strat, held in list(bot_state["strategy_positions"].items()):
-                if held == symbol:
-                    bot_state["strategy_positions"][strat] = None
+            for strat in STRATEGIES:
+                bot_state["strategy_positions"][strat] = [
+                    s for s in bot_state["strategy_positions"].get(strat, []) if s != symbol
+                ]
 
             add_diary(symbol,
                 f"{'WIN' if win else 'LOSS'} [{side.upper()}] | "
@@ -910,8 +913,8 @@ def try_entry(symbol, strategy, sig, regime, side, now):
     if score < min_score: return
     if not sig.get("atr_ok", True) and strategy in ["EMA", "MSS"]: return
 
-    # SQQQ only buys when bearish signals fire
-    if symbol == "SQQQ" and side == "long":
+    # SQQQ and TLT profit from bear market — use short score
+    if symbol in ["SQQQ", "TLT"] and side == "long":
         if sig.get("short_score", 0) < min_score: return
 
     # Time window checks
@@ -938,7 +941,8 @@ def try_entry(symbol, strategy, sig, regime, side, now):
             "open_date": get_et_time().date().isoformat(),
             "strategy": strategy
         }
-        bot_state["strategy_positions"][strategy] = symbol
+        if symbol not in bot_state["strategy_positions"].get(strategy, []):
+            bot_state["strategy_positions"][strategy].append(symbol)
 
         # Mark gap as fired today
         if strategy == "Gap":
@@ -960,11 +964,11 @@ def trading_loop():
         return
 
     add_diary("SYSTEM",
-        "ETF Bot v2.1 started | SPY+QQQ+GLD+SQQQ | "
+        "ETF Bot v3.0 started | SPY+QQQ+GLD+SQQQ+IWM+DIA+XLF+XLK+TLT | "
         "5 Strategies: EMA+MSS+VPA+Breakout+Gap | "
         "TP=1.5% SL=0.75% | 1H lockout | No PDT | "
         "Bear threshold=3 | Force close 3:55PM ET", "system")
-    log.info("ETF Bot v2.1 started")
+    log.info("ETF Bot v3.0 started")
 
     regime_check_time = None
     vix_check_time    = None
@@ -1053,7 +1057,7 @@ def trading_loop():
 
                 # Run all 5 strategies in priority order
                 # Gap (highest priority — time sensitive, only fires at open)
-                if bot_state["strategy_positions"]["Gap"] is None:
+                if len(bot_state["strategy_positions"].get("Gap", [])) < 2:
                     sig = run_gap_detector(symbol, regime)
                     if sig:
                         if sig.get("long_score", 0) >= RISK["min_score_long"]:
@@ -1062,7 +1066,7 @@ def trading_loop():
                             try_entry(symbol, "Gap", sig, regime, "short", now)
 
                 # Breakout
-                if bot_state["strategy_positions"]["Breakout"] is None:
+                if len(bot_state["strategy_positions"].get("Breakout", [])) < 2:
                     sig = run_breakout(symbol, regime)
                     if sig:
                         if sig.get("long_score", 0) >= RISK["min_score_long"]:
@@ -1071,7 +1075,7 @@ def trading_loop():
                             try_entry(symbol, "Breakout", sig, regime, "short", now)
 
                 # VPA
-                if bot_state["strategy_positions"]["VPA"] is None:
+                if len(bot_state["strategy_positions"].get("VPA", [])) < 2:
                     sig = run_vpa(symbol, regime)
                     if sig:
                         if sig.get("long_score", 0) >= VPA_CONFIG["min_score"]:
@@ -1080,7 +1084,7 @@ def trading_loop():
                             try_entry(symbol, "VPA", sig, regime, "short", now)
 
                 # MSS
-                if bot_state["strategy_positions"]["MSS"] is None:
+                if len(bot_state["strategy_positions"].get("MSS", [])) < 2:
                     sig = run_mss(symbol, regime)
                     if sig:
                         if sig.get("long_score", 0) >= RISK["min_score_long"]:
@@ -1089,7 +1093,7 @@ def trading_loop():
                             try_entry(symbol, "MSS", sig, regime, "short", now)
 
                 # EMA
-                if bot_state["strategy_positions"]["EMA"] is None:
+                if len(bot_state["strategy_positions"].get("EMA", [])) < 2:
                     sig = run_ema(symbol, regime)
                     if sig:
                         if sig.get("long_score", 0) >= RISK["min_score_long"]:
