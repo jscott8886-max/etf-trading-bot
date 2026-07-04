@@ -52,7 +52,8 @@ VPA_CONFIG = {
     "volume_avg_period": 20,
     "min_close_ratio": 0.6,
     "effort_result_ratio": 0.015,
-    "min_score": 3,
+    "min_score": 4,  # FIX: raised 3->4 to match crypto/forex confirmed threshold — weak scores were the problem there
+    "bear_score_cap": 4,  # FIX: cap in bear regime — high VPA score in downtrend = distribution
     "time_filter": False,
 }
 
@@ -93,7 +94,7 @@ RISK = {
     "min_score_short_bear": 3,
     "long_only": LONG_ONLY,
     "short_eligible": SHORT_ELIG,
-    "cooldown_minutes": 10,
+    "cooldown_minutes": 10, "time_exit_minutes": 30,
 }
 
 bot_state = {
@@ -119,7 +120,7 @@ bot_state = {
     "gap_fired_today": {},   # Track gap signals already fired today
     "mss_last_signal_time": {s: None for s in ["SPY","QQQ","GLD","SQQQ","IWM","DIA","XLF","XLK","TLT"]},
     "pending_confirmation": {},
-    "version": "ETF-3.0"
+    "version": "ETF-4.0"
 }
 
 # ── Alpaca helpers ─────────────────────────────────────────────────────────────
@@ -454,9 +455,9 @@ def can_enter(symbol, strategy, side):
     return True, "OK"
 
 # ── STRATEGY A: EMA ────────────────────────────────────────────────────────────
-def run_ema(symbol, regime):
+def run_ema(symbol, regime, tf="5Min"):
     try:
-        bars_5m = get_bars(symbol, "5Min", 80)
+        bars_5m = get_bars(symbol, tf, 80)
         bars_1h = get_bars(symbol, "1Hour", 60)
         if len(bars_5m) < 30 or len(bars_1h) < 20: return {}
 
@@ -533,9 +534,9 @@ def run_ema(symbol, regime):
         log.error(f"[EMA] error {symbol}: {e}"); return {}
 
 # ── STRATEGY B: MSS ────────────────────────────────────────────────────────────
-def run_mss(symbol, regime):
+def run_mss(symbol, regime, tf="5Min"):
     try:
-        bars_5m = get_bars(symbol, "5Min", 80)
+        bars_5m = get_bars(symbol, tf, 80)
         bars_1h = get_bars(symbol, "1Hour", 30)
         if len(bars_5m) < 20 or len(bars_1h) < 15: return {}
 
@@ -615,9 +616,9 @@ def run_mss(symbol, regime):
         log.error(f"[MSS] error {symbol}: {e}"); return {}
 
 # ── STRATEGY C: VPA ────────────────────────────────────────────────────────────
-def run_vpa(symbol, regime):
+def run_vpa(symbol, regime, tf="5Min"):
     try:
-        bars = get_bars(symbol, "5Min", 40)
+        bars = get_bars(symbol, tf, 40)
         if len(bars) < 25: return {}
 
         volumes = [b["volume"] for b in bars]
@@ -673,6 +674,11 @@ def run_vpa(symbol, regime):
         if ema20 and price > ema20[-1]: long_score += 1
         if ema20 and price < ema20[-1]: short_score += 1
 
+        # FIX: cap VPA long_score in bear regime — high score in downtrend = distribution not accumulation
+        if regime == "BEAR" and long_score > VPA_CONFIG.get("bear_score_cap", 99):
+            long_score = VPA_CONFIG["bear_score_cap"]
+            long_signals.append("BEAR_CAPPED")
+
         sig = {
             "price": price, "vol_ratio": round(vol_ratio,2),
             "close_ratio": round(close_ratio,2),
@@ -686,9 +692,9 @@ def run_vpa(symbol, regime):
         log.error(f"[VPA] error {symbol}: {e}"); return {}
 
 # ── STRATEGY D: BREAKOUT ───────────────────────────────────────────────────────
-def run_breakout(symbol, regime):
+def run_breakout(symbol, regime, tf="5Min"):
     try:
-        bars = get_bars(symbol, "5Min", 40)
+        bars = get_bars(symbol, tf, 40)
         if len(bars) < 14: return {}
 
         closes  = [b["close"]  for b in bars]
@@ -846,12 +852,24 @@ def check_exits(symbol, now, force_close=False):
     should_exit = False
     reason = ""
 
+    # FIX: 30-minute time exit — data showed losers rarely recover after 30min
+    open_time_str = pos.get("open_time")
+    minutes_open = 0
+    if open_time_str:
+        try:
+            minutes_open = (now - datetime.fromisoformat(open_time_str)).total_seconds() / 60
+        except: pass
+
     if force_close and is_same_day_position(symbol):
         should_exit = True; reason = "Force close 3:55PM ET"
     elif pct >= RISK["take_profit_pct"]:
         should_exit = True; reason = f"Take profit (+{round(pct,2)}%)"
     elif pct <= -RISK["stop_loss_pct"]:
         should_exit = True; reason = f"Stop loss ({round(pct,2)}%)"
+        if side == "short":
+            bot_state["short_lockouts"][symbol] = now.isoformat()
+    elif minutes_open >= RISK.get("time_exit_minutes", 30) and pct < 0:
+        should_exit = True; reason = f"30min time exit ({round(pct,2)}%)"
         if side == "short":
             bot_state["short_lockouts"][symbol] = now.isoformat()
 
@@ -964,11 +982,12 @@ def trading_loop():
         return
 
     add_diary("SYSTEM",
-        "ETF Bot v3.0 started | SPY+QQQ+GLD+SQQQ+IWM+DIA+XLF+XLK+TLT | "
+        "ETF Bot v4.0 started | SPY+QQQ+GLD+SQQQ+IWM+DIA+XLF+XLK+TLT | "
+        "5M+15M scanning | VPA raised 3->4 + bear cap | 30min time exit | "
         "5 Strategies: EMA+MSS+VPA+Breakout+Gap | "
         "TP=1.5% SL=0.75% | 1H lockout | No PDT | "
         "Bear threshold=3 | Force close 3:55PM ET", "system")
-    log.info("ETF Bot v3.0 started")
+    log.info("ETF Bot v4.0 started")
 
     regime_check_time = None
     vix_check_time    = None
@@ -1065,45 +1084,27 @@ def trading_loop():
                         elif sig.get("short_score", 0) >= RISK["min_score_short_bear"] and symbol in SHORT_ELIG:
                             try_entry(symbol, "Gap", sig, regime, "short", now)
 
-                # Breakout
-                if len(bot_state["strategy_positions"].get("Breakout", [])) < 2:
-                    sig = run_breakout(symbol, regime)
-                    if sig:
-                        if sig.get("long_score", 0) >= RISK["min_score_long"]:
-                            try_entry(symbol, "Breakout", sig, regime, "long", now)
-                        if sig.get("short_score", 0) >= (RISK["min_score_short_bear"] if regime=="BEAR" else RISK["min_score_short_bull"]) and symbol in SHORT_ELIG:
-                            try_entry(symbol, "Breakout", sig, regime, "short", now)
-
-                # VPA
-                if len(bot_state["strategy_positions"].get("VPA", [])) < 2:
-                    sig = run_vpa(symbol, regime)
-                    if sig:
-                        if sig.get("long_score", 0) >= VPA_CONFIG["min_score"]:
-                            try_entry(symbol, "VPA", sig, regime, "long", now)
-                        if sig.get("short_score", 0) >= VPA_CONFIG["min_score"] and symbol in SHORT_ELIG:
-                            try_entry(symbol, "VPA", sig, regime, "short", now)
-
-                # MSS
-                if len(bot_state["strategy_positions"].get("MSS", [])) < 2:
-                    sig = run_mss(symbol, regime)
-                    if sig:
-                        if sig.get("long_score", 0) >= RISK["min_score_long"]:
-                            try_entry(symbol, "MSS", sig, regime, "long", now)
-                        if sig.get("short_score", 0) >= (RISK["min_score_short_bear"] if regime=="BEAR" else RISK["min_score_short_bull"]) and symbol in SHORT_ELIG:
-                            try_entry(symbol, "MSS", sig, regime, "short", now)
-
-                # EMA
-                if len(bot_state["strategy_positions"].get("EMA", [])) < 2:
-                    sig = run_ema(symbol, regime)
-                    if sig:
-                        if sig.get("long_score", 0) >= RISK["min_score_long"]:
-                            try_entry(symbol, "EMA", sig, regime, "long", now)
-                        if sig.get("short_score", 0) >= (RISK["min_score_short_bear"] if regime=="BEAR" else RISK["min_score_short_bull"]) and symbol in SHORT_ELIG:
-                            try_entry(symbol, "EMA", sig, regime, "short", now)
-
-                # Update signals dict
-                for strat_name, run_fn in [("EMA",run_ema),("MSS",run_mss),("VPA",run_vpa),("Breakout",run_breakout)]:
-                    pass  # Signals already updated in each run function
+                # Breakout, VPA, MSS, EMA — now scanning 5Min + 15Min (FIX: 15M timeframe added)
+                for strat_name, run_fn, min_score_key in [
+                    ("Breakout", run_breakout, None),
+                    ("VPA", run_vpa, "VPA_MIN"),
+                    ("MSS", run_mss, None),
+                    ("EMA", run_ema, None),
+                ]:
+                    if len(bot_state["strategy_positions"].get(strat_name, [])) >= 2:
+                        continue
+                    for tf in ["5Min", "15Min"]:
+                        sig = run_fn(symbol, regime, tf)
+                        if not sig: continue
+                        long_min = VPA_CONFIG["min_score"] if min_score_key else RISK["min_score_long"]
+                        short_min = VPA_CONFIG["min_score"] if min_score_key else (
+                            RISK["min_score_short_bear"] if regime=="BEAR" else RISK["min_score_short_bull"])
+                        if sig.get("long_score", 0) >= long_min:
+                            try_entry(symbol, strat_name, sig, regime, "long", now)
+                        if sig.get("short_score", 0) >= short_min and symbol in SHORT_ELIG:
+                            try_entry(symbol, strat_name, sig, regime, "short", now)
+                        if len(bot_state["strategy_positions"].get(strat_name, [])) >= 2:
+                            break
 
         except Exception as e:
             log.error(f"Loop error: {e}")
