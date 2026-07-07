@@ -120,7 +120,7 @@ bot_state = {
     "gap_fired_today": {},   # Track gap signals already fired today
     "mss_last_signal_time": {s: None for s in ["SPY","QQQ","GLD","SQQQ","IWM","DIA","XLF","XLK","TLT"]},
     "pending_confirmation": {},
-    "version": "ETF-4.0"
+    "version": "ETF-4.1"
 }
 
 # ── Alpaca helpers ─────────────────────────────────────────────────────────────
@@ -289,12 +289,18 @@ def can_open_short():
     return 570 <= mins < 840  # 9:30AM to 2:00PM
 
 def is_within_open_window():
-    """First 30 minutes after market open — for gap detector"""
+    """First 60 minutes after market open — gap detector waits 10min then trades"""
     et = get_et_time()
     if et.weekday() >= 5:
         return False
     mins = et.hour * 60 + et.minute
-    return 570 <= mins < 600  # 9:30AM to 10:00AM
+    return 570 <= mins < 630  # 9:30AM to 10:30AM
+
+def is_gap_confirmation_ready():
+    """Returns True after 9:40AM ET — 10 minutes after open for gap direction confirmation"""
+    et = get_et_time()
+    mins = et.hour * 60 + et.minute
+    return mins >= 580  # 9:40AM ET
 
 def should_force_close():
     et = get_et_time()
@@ -772,7 +778,15 @@ def run_breakout(symbol, regime, tf="5Min"):
 
 # ── STRATEGY E: GAP DETECTOR ───────────────────────────────────────────────────
 def run_gap_detector(symbol, regime):
-    """Only fires within first 30 minutes of market open"""
+    """Gap Fill Strategy — waits 10 minutes after open to determine gap direction.
+    
+    Logic:
+    1. Detect gap at 9:30AM (gap up or gap down vs yesterday's close)
+    2. Wait until 9:40AM for 2 completed 5M candles
+    3. If price is BELOW today's open → gap is filling → SHORT the fill (ride it down)
+    4. If price is ABOVE today's open → gap is continuing → BUY the momentum
+    5. GLD/SQQQ can't be shorted — skip gap-fill shorts on those
+    """
     try:
         if not is_within_open_window():
             return {}
@@ -789,9 +803,9 @@ def run_gap_detector(symbol, regime):
         prev_close = bars_daily[-2]["close"]
         bot_state["prev_closes"][symbol] = prev_close
 
-        # Get today's first 5M candle
-        bars_5m = get_bars(symbol, "5Min", 5)
-        if not bars_5m: return {}
+        # Get today's 5M candles (need at least 2 completed = 10 minutes)
+        bars_5m = get_bars(symbol, "5Min", 10)
+        if not bars_5m or len(bars_5m) < 3: return {}
 
         today_open  = bars_5m[0]["open"]
         today_price = bars_5m[-1]["close"]
@@ -799,30 +813,67 @@ def run_gap_detector(symbol, regime):
 
         # Average volume from daily bars
         avg_vol = sum(b["volume"] for b in bars_daily[-5:]) / len(bars_daily[-5:])
-        # Convert daily avg to per-5min estimate
         avg_5m_vol = avg_vol / 78  # ~78 five-minute candles per trading day
         vol_ratio  = curr_vol / avg_5m_vol if avg_5m_vol > 0 else 1
 
         gap_pct = (today_open - prev_close) / prev_close * 100
-
-        is_gap_up   = gap_pct >= GAP_CONFIG["min_gap_pct"] and gap_pct <= GAP_CONFIG["max_gap_pct"]
-        is_gap_down = gap_pct <= -GAP_CONFIG["min_gap_pct"] and gap_pct >= -GAP_CONFIG["max_gap_pct"]
+        is_gap = abs(gap_pct) >= GAP_CONFIG["min_gap_pct"] and abs(gap_pct) <= GAP_CONFIG["max_gap_pct"]
         vol_ok = vol_ratio >= GAP_CONFIG["volume_confirm_mult"]
 
-        long_score  = 5 if (is_gap_up and vol_ok) else 0
-        short_score = 5 if (is_gap_down and vol_ok) else 0
+        if not is_gap:
+            return {}  # No significant gap today
 
-        if long_score > 0 or short_score > 0:
-            log.info(f"[Gap] {symbol} | gap={round(gap_pct,2)}% vol={round(vol_ratio,1)}x L={long_score} S={short_score}")
+        # Wait for 10-minute confirmation before deciding direction
+        if not is_gap_confirmation_ready():
+            log.info(f"[Gap] {symbol} | gap={round(gap_pct,2)}% detected — waiting for 9:40AM confirmation")
+            return {}
+
+        # Determine direction: is the gap filling or continuing?
+        price_vs_open = today_price - today_open
+        gap_filling = (gap_pct > 0 and price_vs_open < 0) or (gap_pct < 0 and price_vs_open > 0)
+        gap_continuing = not gap_filling
+
+        long_score = 0
+        short_score = 0
+        gap_action = ""
+
+        if gap_filling:
+            if gap_pct > 0:
+                # Gap UP is filling — price falling back — SHORT the fill
+                short_score = 5
+                gap_action = "GAP_FILL_SHORT"
+                log.info(f"[Gap] {symbol} | Gap UP {round(gap_pct,2)}% FILLING — price below open — SHORT signal")
+            else:
+                # Gap DOWN is filling — price rising back — BUY the fill
+                long_score = 5
+                gap_action = "GAP_FILL_LONG"
+                log.info(f"[Gap] {symbol} | Gap DOWN {round(gap_pct,2)}% FILLING — price above open — LONG signal")
+        else:
+            if gap_pct > 0:
+                # Gap UP continuing — price still above open — BUY momentum
+                long_score = 5
+                gap_action = "GAP_CONTINUE_LONG"
+                log.info(f"[Gap] {symbol} | Gap UP {round(gap_pct,2)}% CONTINUING — price above open — LONG signal")
+            else:
+                # Gap DOWN continuing — price still below open — SHORT momentum
+                short_score = 5
+                gap_action = "GAP_CONTINUE_SHORT"
+                log.info(f"[Gap] {symbol} | Gap DOWN {round(gap_pct,2)}% CONTINUING — price below open — SHORT signal")
+
+        # Volume confirmation required
+        if not vol_ok:
+            long_score = 0
+            short_score = 0
 
         sig = {
             "price": today_price,
-            "prev_close": round(prev_close,2),
-            "today_open": round(today_open,2),
-            "gap_pct": round(gap_pct,2),
-            "vol_ratio": round(vol_ratio,2),
-            "is_gap_up": is_gap_up,
-            "is_gap_down": is_gap_down,
+            "prev_close": round(prev_close, 2),
+            "today_open": round(today_open, 2),
+            "gap_pct": round(gap_pct, 2),
+            "vol_ratio": round(vol_ratio, 2),
+            "gap_filling": gap_filling,
+            "gap_continuing": gap_continuing,
+            "gap_action": gap_action,
             "vol_ok": vol_ok,
             "long_score": long_score,
             "short_score": short_score,
@@ -987,7 +1038,7 @@ def trading_loop():
         "5 Strategies: EMA+MSS+VPA+Breakout+Gap | "
         "TP=1.5% SL=0.75% | 1H lockout | No PDT | "
         "Bear threshold=3 | Force close 3:55PM ET", "system")
-    log.info("ETF Bot v4.0 started")
+    log.info("ETF Bot v4.1 started")
 
     regime_check_time = None
     vix_check_time    = None
