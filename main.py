@@ -1,6 +1,7 @@
-# ETF Trading Bot - v2.0
-# 5 Strategies: EMA + MSS + VPA + Breakout + Gap Detector
-# SPY + QQQ + GLD + SQQQ | Long + Short
+# ETF Trading Bot - v4.1
+# 5 Strategies: EMA + MSS + VPA + Breakout + Gap Fill Detector
+# SPY + QQQ + GLD + SQQQ + IWM + DIA + XLF + XLK + TLT
+# Gap fill logic: wait 10min, short the fill or buy the continuation
 # No PDT limit | 1H candle lockout | Force close 3:55PM ET
 import os, time, logging, math
 from datetime import datetime, timezone, timedelta
