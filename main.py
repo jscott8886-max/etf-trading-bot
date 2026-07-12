@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import threading
+import requests
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -18,6 +19,10 @@ CORS(app)
 API_KEY    = os.environ.get("ALPACA_API_KEY", "")
 API_SECRET = os.environ.get("ALPACA_API_SECRET", "")
 PAPER_MODE = os.environ.get("PAPER_MODE", "true").lower() == "true"
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
 
 SYMBOLS    = ["SPY", "QQQ", "GLD", "SQQQ", "IWM", "DIA", "XLF", "XLK", "TLT"]
 LONG_ONLY  = ["GLD", "SQQQ"]
@@ -121,8 +126,20 @@ bot_state = {
     "gap_fired_today": {},   # Track gap signals already fired today
     "mss_last_signal_time": {s: None for s in ["SPY","QQQ","GLD","SQQQ","IWM","DIA","XLF","XLK","TLT"]},
     "pending_confirmation": {},
-    "version": "ETF-4.1"
+    "loss_streak": 0,
+    "version": "ETF-5.0"
 }
+
+
+def send_telegram(message):
+    """Send notification to Telegram"""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=5)
+    except Exception as e:
+        log.error(f"Telegram error: {e}")
 
 # ── Alpaca helpers ─────────────────────────────────────────────────────────────
 def get_trading_client():
@@ -361,6 +378,33 @@ def calc_atr(bars, period=14):
         h = bars[i]["high"]; l = bars[i]["low"]; pc = bars[i-1]["close"]
         trs.append(max(h-l, abs(h-pc), abs(l-pc)))
     return sum(trs[-period:]) / period if len(trs) >= period else sum(trs)/len(trs)
+
+def calc_adx(bars, period=14):
+    """ADX trend strength — above 25 = trending, below 20 = choppy"""
+    if len(bars) < period * 2 + 1: return 0.0
+    try:
+        plus_dm, minus_dm, tr_list = [], [], []
+        for i in range(1, len(bars)):
+            h = bars[i]["high"]; l = bars[i]["low"]
+            ph = bars[i-1]["high"]; pl = bars[i-1]["low"]; pc = bars[i-1]["close"]
+            tr_list.append(max(h-l, abs(h-pc), abs(l-pc)))
+            up = h - ph; down = pl - l
+            plus_dm.append(up if up > down and up > 0 else 0)
+            minus_dm.append(down if down > up and down > 0 else 0)
+        if len(tr_list) < period: return 0.0
+        atr_val = sum(tr_list[:period]) / period
+        pdi_sum = sum(plus_dm[:period]) / period
+        mdi_sum = sum(minus_dm[:period]) / period
+        for i in range(period, len(tr_list)):
+            atr_val = (atr_val * (period-1) + tr_list[i]) / period
+            pdi_sum = (pdi_sum * (period-1) + plus_dm[i]) / period
+            mdi_sum = (mdi_sum * (period-1) + minus_dm[i]) / period
+        if atr_val == 0: return 0.0
+        pdi = (pdi_sum / atr_val) * 100; mdi = (mdi_sum / atr_val) * 100
+        di_sum = pdi + mdi
+        if di_sum == 0: return 0.0
+        return abs(pdi - mdi) / di_sum * 100
+    except: return 0.0
 
 # ── Market regime & VIX ────────────────────────────────────────────────────────
 def check_market_regime():
@@ -904,14 +948,6 @@ def check_exits(symbol, now, force_close=False):
     should_exit = False
     reason = ""
 
-    # FIX: 30-minute time exit — data showed losers rarely recover after 30min
-    open_time_str = pos.get("open_time")
-    minutes_open = 0
-    if open_time_str:
-        try:
-            minutes_open = (now - datetime.fromisoformat(open_time_str)).total_seconds() / 60
-        except: pass
-
     if force_close and is_same_day_position(symbol):
         should_exit = True; reason = "Force close 3:55PM ET"
     elif pct >= RISK["take_profit_pct"]:
@@ -920,10 +956,7 @@ def check_exits(symbol, now, force_close=False):
         should_exit = True; reason = f"Stop loss ({round(pct,2)}%)"
         if side == "short":
             bot_state["short_lockouts"][symbol] = now.isoformat()
-    elif minutes_open >= RISK.get("time_exit_minutes", 30) and pct < 0:
-        should_exit = True; reason = f"30min time exit ({round(pct,2)}%)"
-        if side == "short":
-            bot_state["short_lockouts"][symbol] = now.isoformat()
+    # No time exit — TP, SL, and 3:55PM force close handle all exits
 
     if should_exit:
         success = close_position_alpaca(symbol)
@@ -1039,7 +1072,8 @@ def trading_loop():
         "5 Strategies: EMA+MSS+VPA+Breakout+Gap | "
         "TP=1.5% SL=0.75% | 1H lockout | No PDT | "
         "Bear threshold=3 | Force close 3:55PM ET", "system")
-    log.info("ETF Bot v4.1 started")
+    log.info("ETF Bot v5.0 started")
+    send_telegram("🚀 <b>ETF Bot v5.0 started</b>\n9 symbols | Gap fill | ADX filter | No time exit")
 
     regime_check_time = None
     vix_check_time    = None
