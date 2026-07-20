@@ -127,7 +127,7 @@ bot_state = {
     "mss_last_signal_time": {s: None for s in ["SPY","QQQ","GLD","SQQQ","IWM","DIA","XLF","XLK","TLT"]},
     "pending_confirmation": {},
     "loss_streak": 0,
-    "version": "ETF-5.0"
+    "version": "ETF-6.0"
 }
 
 
@@ -236,16 +236,37 @@ def sync_positions():
     except Exception as e:
         log.error(f"Sync positions error: {e}")
 
-def place_order(symbol, qty, side):
+def place_order(symbol, qty, side, entry_price=None):
+    """Place order with server-side bracket SL/TP — Alpaca executes stops instantly.
+    Prevents the 60-second-gap SL overshoots (like the XLF -1.21% loss)."""
     try:
-        from alpaca.trading.requests import MarketOrderRequest
-        from alpaca.trading.enums import OrderSide, TimeInForce
+        from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
+        from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
         tc = get_trading_client()
-        req = MarketOrderRequest(
-            symbol=symbol, qty=round(qty, 2),
-            side=OrderSide.BUY if side == "BUY" else OrderSide.SELL,
-            time_in_force=TimeInForce.DAY
-        )
+
+        # If we have an entry price, attach a server-side bracket (TP + SL)
+        if entry_price and entry_price > 0:
+            if side == "BUY":
+                tp_price = round(entry_price * (1 + RISK["take_profit_pct"]/100), 2)
+                sl_price = round(entry_price * (1 - RISK["stop_loss_pct"]/100), 2)
+            else:  # SELL/short
+                tp_price = round(entry_price * (1 - RISK["take_profit_pct"]/100), 2)
+                sl_price = round(entry_price * (1 + RISK["stop_loss_pct"]/100), 2)
+            req = MarketOrderRequest(
+                symbol=symbol, qty=round(qty, 2),
+                side=OrderSide.BUY if side == "BUY" else OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+                order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(limit_price=tp_price),
+                stop_loss=StopLossRequest(stop_price=sl_price)
+            )
+        else:
+            # Fallback: plain market order (e.g. for closing)
+            req = MarketOrderRequest(
+                symbol=symbol, qty=round(qty, 2),
+                side=OrderSide.BUY if side == "BUY" else OrderSide.SELL,
+                time_in_force=TimeInForce.DAY
+            )
         return tc.submit_order(req)
     except Exception as e:
         log.error(f"Order error {symbol} {side}: {e}")
@@ -1034,7 +1055,8 @@ def try_entry(symbol, strategy, sig, regime, side, now):
     if budget < 50 or qty < 0.01: return
 
     order_side = "BUY" if side == "long" else "SELL"
-    order = place_order(symbol, qty, order_side)
+    # Pass entry price so Alpaca sets server-side bracket SL/TP (no more 60-sec gap overshoots)
+    order = place_order(symbol, qty, order_side, entry_price=price)
 
     if order:
         bot_state["positions"][symbol] = {
@@ -1072,8 +1094,8 @@ def trading_loop():
         "5 Strategies: EMA+MSS+VPA+Breakout+Gap | "
         "TP=1.5% SL=0.75% | 1H lockout | No PDT | "
         "Bear threshold=3 | Force close 3:55PM ET", "system")
-    log.info("ETF Bot v5.0 started")
-    send_telegram("🚀 <b>ETF Bot v5.0 started</b>\n9 symbols | Gap fill | ADX filter | No time exit")
+    log.info("ETF Bot v6.0 started")
+    send_telegram("🚀 <b>ETF Bot v6.0 started</b>\n9 symbols | Gap fill | ADX filter | No time exit")
 
     regime_check_time = None
     vix_check_time    = None
