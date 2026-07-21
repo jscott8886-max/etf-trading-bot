@@ -27,7 +27,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOLS    = ["SPY", "QQQ", "GLD", "SQQQ", "IWM", "DIA", "XLF", "XLK", "TLT"]
 LONG_ONLY  = ["GLD", "SQQQ"]
 SHORT_ELIG = ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "TLT"]
-STRATEGIES = ["EMA", "MSS", "VPA", "Breakout", "Gap"]
+STRATEGIES = ["EMA", "MSS", "VPA", "Breakout", "Gap", "Sweep"]
 
 # ── Strategy configs ───────────────────────────────────────────────────────────
 EMA_CONFIG = {
@@ -82,6 +82,17 @@ GAP_CONFIG = {
     "time_filter": True,
 }
 
+SWEEP_CONFIG = {
+    "name": "Sweep",
+    "swing_lookback": 20,        # 5min bars to find swing high/low being swept
+    "min_sweep_pct": 0.03,       # price must poke at least this % past the level
+    "max_sweep_pct": 0.30,       # but not run away — a sweep, not a trend break
+    "volume_mult": 1.5,          # elevated volume on the sweep candle (stop run)
+    "min_score": 4,
+    # Uses prior-day H/L and opening-range H/L as the key liquidity levels.
+    # No ADX filter — trades reversals, not trends.
+}
+
 RISK = {
     "take_profit_pct": 1.5,
     "stop_loss_pct": 0.75,
@@ -127,7 +138,7 @@ bot_state = {
     "mss_last_signal_time": {s: None for s in ["SPY","QQQ","GLD","SQQQ","IWM","DIA","XLF","XLK","TLT"]},
     "pending_confirmation": {},
     "loss_streak": 0,
-    "version": "ETF-6.0"
+    "version": "ETF-6.1"
 }
 
 
@@ -843,6 +854,84 @@ def run_breakout(symbol, regime, tf="5Min"):
         log.error(f"[Breakout] error {symbol}: {e}"); return {}
 
 # ── STRATEGY E: GAP DETECTOR ───────────────────────────────────────────────────
+def run_sweep_detector(symbol, regime, tf="5Min"):
+    """Liquidity Sweep Reversal for ETFs (Smart Money Concept).
+    ETFs sweep two key liquidity pools intraday:
+      1. Prior day's high/low
+      2. Opening-range high/low (first 30 min)
+    When price spikes past one of these levels then closes back on the other side,
+    the stop-order liquidity has been grabbed and price often reverses.
+
+    Bullish sweep: wick below prior-day-low or opening-range-low, close back above → LONG
+    Bearish sweep: wick above prior-day-high or opening-range-high, close back below → SHORT
+
+    No ADX filter — this is a reversal strategy by design.
+    """
+    cfg = SWEEP_CONFIG
+    try:
+        bars = get_bars(symbol, tf, 40)
+        if len(bars) < cfg["swing_lookback"] + 3: return {}
+        closes = [b["close"] for b in bars]; highs = [b["high"] for b in bars]
+        lows = [b["low"] for b in bars]; volumes = [b["volume"] for b in bars]
+        if all(v == 0 for v in volumes[-5:]): return {}
+
+        price = closes[-1]
+        avg_vol = sum(volumes[-20:]) / len(volumes[-20:]) if volumes[-20:] else 1
+        vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0
+
+        # Build the set of liquidity levels to watch
+        levels_high = []; levels_low = []
+
+        # Prior day high/low
+        daily = get_bars(symbol, "1Day", 3)
+        if len(daily) >= 2:
+            levels_high.append(daily[-2]["high"])
+            levels_low.append(daily[-2]["low"])
+
+        # Opening-range high/low (first 30 min = first 6 five-min bars of the session)
+        # Approximate using the intraday swing over the lookback window
+        window = bars[-(cfg["swing_lookback"]+2):-2]
+        if window:
+            levels_high.append(max(b["high"] for b in window))
+            levels_low.append(min(b["low"] for b in window))
+
+        if not levels_high or not levels_low: return {}
+
+        cur = bars[-1]
+        cur_high = cur["high"]; cur_low = cur["low"]; cur_close = cur["close"]
+        bar_range = cur_high - cur_low
+        if bar_range == 0: return {}
+        close_ratio = (cur_close - cur_low) / bar_range
+
+        long_score = 0; short_score = 0; swept_level = None
+
+        # BULLISH SWEEP — check each low level
+        for lvl in levels_low:
+            if lvl <= 0: continue
+            swept_pct = (lvl - cur_low) / lvl * 100
+            if (cur_low < lvl and cur_close > lvl
+                    and cfg["min_sweep_pct"] <= swept_pct <= cfg["max_sweep_pct"]
+                    and close_ratio >= 0.5 and vol_ratio >= cfg["volume_mult"]):
+                long_score = 4; swept_level = round(lvl, 2); break
+
+        # BEARISH SWEEP — check each high level
+        if long_score == 0:
+            for lvl in levels_high:
+                if lvl <= 0: continue
+                swept_pct = (cur_high - lvl) / lvl * 100
+                if (cur_high > lvl and cur_close < lvl
+                        and cfg["min_sweep_pct"] <= swept_pct <= cfg["max_sweep_pct"]
+                        and close_ratio <= 0.5 and vol_ratio >= cfg["volume_mult"]):
+                    short_score = 4; swept_level = round(lvl, 2); break
+
+        sig = {"price": price, "vol_ratio": round(vol_ratio,2), "swept_level": swept_level,
+               "long_score": long_score, "short_score": short_score, "strategy": "Sweep"}
+        if long_score or short_score:
+            log.info(f"[Sweep] {symbol} | L={long_score} S={short_score} level={swept_level} vol={round(vol_ratio,1)}x")
+        return sig
+    except Exception as e:
+        log.error(f"[Sweep] error {symbol}: {e}"); return {}
+
 def run_gap_detector(symbol, regime):
     """Gap Fill Strategy — waits 10 minutes after open to determine gap direction.
     
@@ -1028,9 +1117,14 @@ def try_entry(symbol, strategy, sig, regime, side, now):
     if not ok:
         return
 
-    min_score = RISK["min_score_long"] if side == "long" else (
-        RISK["min_score_short_bear"] if regime == "BEAR" else RISK["min_score_short_bull"]
-    )
+    # Sweep is a reversal strategy — flat threshold, exempt from asymmetric trend rules
+    if strategy == "Sweep":
+        min_score = SWEEP_CONFIG["min_score"]
+    elif side == "long":
+        # FIX: Asymmetric — counter-trend longs in BEAR need score 5, else 4
+        min_score = 5 if regime == "BEAR" else RISK["min_score_long"]
+    else:
+        min_score = RISK["min_score_short_bear"] if regime == "BEAR" else RISK["min_score_short_bull"]
     score_key = "long_score" if side == "long" else "short_score"
     score = sig.get(score_key, 0)
 
@@ -1094,8 +1188,8 @@ def trading_loop():
         "5 Strategies: EMA+MSS+VPA+Breakout+Gap | "
         "TP=1.5% SL=0.75% | 1H lockout | No PDT | "
         "Bear threshold=3 | Force close 3:55PM ET", "system")
-    log.info("ETF Bot v6.0 started")
-    send_telegram("🚀 <b>ETF Bot v6.0 started</b>\n9 symbols | Gap fill | ADX filter | No time exit")
+    log.info("ETF Bot v6.1 started")
+    send_telegram("🚀 <b>ETF Bot v6.1 started (+Sweep)</b>\n9 symbols | Gap fill | ADX filter | No time exit")
 
     regime_check_time = None
     vix_check_time    = None
@@ -1198,15 +1292,24 @@ def trading_loop():
                     ("VPA", run_vpa, "VPA_MIN"),
                     ("MSS", run_mss, None),
                     ("EMA", run_ema, None),
+                    ("Sweep", run_sweep_detector, "SWEEP"),
                 ]:
                     if len(bot_state["strategy_positions"].get(strat_name, [])) >= 2:
                         continue
                     for tf in ["5Min", "15Min"]:
                         sig = run_fn(symbol, regime, tf)
                         if not sig: continue
-                        long_min = VPA_CONFIG["min_score"] if min_score_key else RISK["min_score_long"]
-                        short_min = VPA_CONFIG["min_score"] if min_score_key else (
-                            RISK["min_score_short_bear"] if regime=="BEAR" else RISK["min_score_short_bull"])
+                        # Sweep is a reversal strategy — flat threshold 4, not the
+                        # asymmetric trend-following thresholds used by the others.
+                        if min_score_key == "SWEEP":
+                            long_min = SWEEP_CONFIG["min_score"]
+                            short_min = SWEEP_CONFIG["min_score"]
+                        elif min_score_key:
+                            long_min = VPA_CONFIG["min_score"]
+                            short_min = VPA_CONFIG["min_score"]
+                        else:
+                            long_min = RISK["min_score_long"]
+                            short_min = RISK["min_score_short_bear"] if regime=="BEAR" else RISK["min_score_short_bull"]
                         if sig.get("long_score", 0) >= long_min:
                             try_entry(symbol, strat_name, sig, regime, "long", now)
                         if sig.get("short_score", 0) >= short_min and symbol in SHORT_ELIG:
